@@ -35,7 +35,7 @@ cmd/bot/                 entrypoint, health endpoint, graceful shutdown
 internal/scheduler/      5-minute market cycle and 4-hour news refresh
 internal/broker/         Alpaca REST client (orders, positions)
 internal/news/           Alpaca News client
-internal/claude/         prompt builder and Gemini client (package name predates the switch to Gemini)
+internal/gemini/         prompt builder and Gemini client
 internal/portfolio/      position lookup
 internal/market/         market-hours check
 internal/indicators/     Go wrapper around the Python script
@@ -57,6 +57,7 @@ go run ./cmd/bot
 | `ALPACA_API_KEY`, `ALPACA_API_SECRET` | Alpaca paper-trading credentials |
 | `ALPACA_BASE_URL` | Defaults to `https://paper-api.alpaca.markets` |
 | `GEMINI_API_KEY` | Google AI Studio key |
+| `MAX_POSITION_USD` | Max position size per symbol in USD; BUY quantity is capped so current + new value doesn't exceed this (default `5000`) |
 | `PORT` | Port for the `/health` endpoint (default `8080`) |
 
 ## Deployment
@@ -65,15 +66,10 @@ The included `Dockerfile` builds the Go binary on top of a Python image. `render
 
 ## Known limitations
 
-- `stop_loss` and `take_profit` are requested from the model and logged, but orders are plain market orders; bracket orders are not implemented yet.
-- No position-size or portfolio-level risk limits: order quantity comes straight from the model.
 - Indicators use daily bars but the loop runs every five minutes, so consecutive cycles often see near-identical data.
-- Market hours are checked by weekday and time only; exchange holidays are not handled.
 - No backtesting and no persistence of decisions beyond logs.
 
 ## Roadmap
 
-- Bracket orders and hard risk limits (max position size, max exposure)
-- Alpaca market-clock endpoint instead of the manual hours check
 - Decision log in a database plus a small dashboard
 - Backtesting harness to evaluate the prompt and indicators offline

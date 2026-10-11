@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/francocaccia/quantengine/internal/broker"
-	"github.com/francocaccia/quantengine/internal/claude"
+	"github.com/francocaccia/quantengine/internal/gemini"
 	"github.com/francocaccia/quantengine/internal/indicators"
 	"github.com/francocaccia/quantengine/internal/market"
 	"github.com/francocaccia/quantengine/internal/news"
@@ -14,11 +14,12 @@ import (
 )
 
 type Config struct {
-	Broker    *broker.AlpacaClient
-	News      *news.AlpacaNewsClient
-	Claude    *claude.Client
-	Portfolio *portfolio.Portfolio
-	Watchlist []string
+	Broker         *broker.AlpacaClient
+	News           *news.AlpacaNewsClient
+	Gemini         *gemini.Client
+	Portfolio      *portfolio.Portfolio
+	Watchlist      []string
+	MaxPositionUSD float64
 }
 
 type Scheduler struct {
@@ -75,8 +76,12 @@ func (s *Scheduler) runMarketCycle() {
 		log.Println("[Scheduler] Paused — skipping cycle")
 		return
 	}
-	isOpen, err := market.IsMarketOpen()
-	if err != nil || !isOpen {
+	isOpen, err := market.IsMarketOpen(s.cfg.Broker)
+	if err != nil {
+		log.Printf("[Market] Clock check failed: %v — skipping cycle", err)
+		return
+	}
+	if !isOpen {
 		log.Println("[Market] Closed — skipping cycle")
 		return
 	}
@@ -92,26 +97,26 @@ func (s *Scheduler) evaluateSymbol(symbol string) {
 		log.Printf("[%s] Indicators error: %v", symbol, err)
 		return
 	}
-	position, _ := s.cfg.Portfolio.GetPosition(symbol)
-	prompt := claude.BuildPrompt(claude.PromptInput{
+	position, err := s.cfg.Portfolio.GetPosition(symbol)
+	if err != nil {
+		log.Printf("[%s] Position lookup error: %v — skipping symbol", symbol, err)
+		return
+	}
+	prompt := gemini.BuildPrompt(gemini.PromptInput{
 		Symbol:     symbol,
 		Indicators: ind,
 		Position:   position,
 		News:       s.newsCache,
 	})
-	decision, err := s.cfg.Claude.Decide(prompt)
+	decision, err := s.cfg.Gemini.Decide(prompt)
 	if err != nil {
-		log.Printf("[%s] Claude error: %v", symbol, err)
+		log.Printf("[%s] Gemini error: %v", symbol, err)
 		return
 	}
 	log.Printf("[%s] -> %s | %s", symbol, decision.Action, decision.Reasoning)
 	switch decision.Action {
 	case "BUY":
-		if err := s.cfg.Broker.PlaceMarketOrder(symbol, decision.Quantity, broker.Buy); err != nil {
-			log.Printf("[%s] BUY failed: %v", symbol, err)
-		} else {
-			log.Printf("[%s] BUY %d shares", symbol, decision.Quantity)
-		}
+		s.placeBuy(symbol, ind, position, decision)
 	case "SELL":
 		if err := s.cfg.Broker.PlaceMarketOrder(symbol, decision.Quantity, broker.Sell); err != nil {
 			log.Printf("[%s] SELL failed: %v", symbol, err)
@@ -120,5 +125,50 @@ func (s *Scheduler) evaluateSymbol(symbol string) {
 		}
 	case "HOLD":
 		log.Printf("[%s] HOLD", symbol)
+	}
+}
+
+func (s *Scheduler) placeBuy(symbol string, ind *indicators.Result, position *portfolio.Position, decision *gemini.Decision) {
+	qty := decision.Quantity
+	if qty <= 0 || ind.Price <= 0 {
+		log.Printf("[%s] BUY skipped: invalid quantity (%d) or price (%.2f)", symbol, qty, ind.Price)
+		return
+	}
+
+	currentValue := 0.0
+	if position != nil {
+		currentValue = position.MarketVal
+	}
+	maxPositionUSD := s.cfg.MaxPositionUSD
+	newValue := currentValue + float64(qty)*ind.Price
+	if newValue > maxPositionUSD {
+		allowedValue := maxPositionUSD - currentValue
+		cappedQty := int(allowedValue / ind.Price)
+		log.Printf("[%s] BUY quantity capped from %d to %d: current position $%.2f + order would exceed MAX_POSITION_USD $%.2f",
+			symbol, qty, cappedQty, currentValue, maxPositionUSD)
+		qty = cappedQty
+	}
+	if qty <= 0 {
+		log.Printf("[%s] BUY skipped: position already at or above MAX_POSITION_USD limit ($%.2f >= $%.2f)", symbol, currentValue, maxPositionUSD)
+		return
+	}
+
+	useBracket := decision.StopLoss > 0 && decision.TakeProfit > 0 &&
+		decision.StopLoss < ind.Price && ind.Price < decision.TakeProfit
+	if useBracket {
+		if err := s.cfg.Broker.PlaceBracketOrder(symbol, qty, broker.Buy, decision.StopLoss, decision.TakeProfit); err != nil {
+			log.Printf("[%s] BUY (bracket) failed: %v", symbol, err)
+		} else {
+			log.Printf("[%s] BUY %d shares (bracket, stop=%.2f take=%.2f)", symbol, qty, decision.StopLoss, decision.TakeProfit)
+		}
+		return
+	}
+
+	log.Printf("[%s] stop_loss/take_profit invalid (stop=%.2f price=%.2f take=%.2f) — using plain market order",
+		symbol, decision.StopLoss, ind.Price, decision.TakeProfit)
+	if err := s.cfg.Broker.PlaceMarketOrder(symbol, qty, broker.Buy); err != nil {
+		log.Printf("[%s] BUY failed: %v", symbol, err)
+	} else {
+		log.Printf("[%s] BUY %d shares", symbol, qty)
 	}
 }
