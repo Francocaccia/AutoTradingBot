@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: autotradingbot
+    runtime: docker
+    plan: free
+    region: virginia
+    healthCheckPath: /health
+    envVars:
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_API_SECRET
+        sync: false
+      - key: ALPACA_BASE_URL
+        value: https://paper-api.alpaca.markets/v2
+      - key: GEMINI_API_KEY
+        sync: false
