@@ -78,6 +78,23 @@ def keltner(df, length=20, scalar=2):
     }
 
 
+def atr(df, length=14):
+    close, high, low = df["Close"], df["High"], df["Low"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+
+    return round(safe(tr.ewm(alpha=1 / length, adjust=False).mean().iloc[-1]), 4)
+
+
+def avg_volume(df, sessions=60):
+    # Exclude the last bar: during the session it is a partial day.
+    hist = df["Volume"].iloc[-(sessions + 1):-1]
+    return round(safe(hist.mean()), 0)
+
+
 def rsi(close, length=14):
     delta = close.diff()
     gain  = delta.clip(lower=0).ewm(span=length).mean()
@@ -102,7 +119,10 @@ def main():
             print(json.dumps({"error": f"not enough data for {symbol}"}))
             sys.exit(1)
 
-        info  = ticker.info
+        try:
+            info = ticker.info or {}
+        except Exception:
+            info = {}
         price = round(safe(df["Close"].iloc[-1]), 4)
         vol   = int(df["Volume"].iloc[-1])
 
@@ -113,6 +133,11 @@ def main():
             "rsi":      rsi(df["Close"]),
             "beta":     round(float(info.get("beta") or 0), 4),
             "pe_ratio": round(float(info.get("trailingPE") or 0), 4),
+            "atr":        atr(df),
+            "avg_volume": avg_volume(df),
+            "sector":     info.get("sector") or "",
+            "name":       info.get("longName") or info.get("shortName") or "",
+            "quote_type": info.get("quoteType") or "",
             "ichimoku":   ichimoku(df),
             "macd":       macd(df["Close"]),
             "stochastic": stochastic(df),

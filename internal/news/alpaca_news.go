@@ -33,8 +33,13 @@ type alpacaNewsResponse struct {
 	News []Article `json:"news"`
 }
 
+// FetchLatest returns the newest articles. With no symbols it returns general
+// market news, which is where new universe candidates come from.
 func (c *AlpacaNewsClient) FetchLatest(symbols []string, limit int) ([]Article, error) {
-	url := fmt.Sprintf("%s?symbols=%s&limit=%d&sort=desc", alpacaNewsURL, strings.Join(symbols, ","), limit)
+	url := fmt.Sprintf("%s?limit=%d&sort=desc", alpacaNewsURL, limit)
+	if len(symbols) > 0 {
+		url += "&symbols=" + strings.Join(symbols, ",")
+	}
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("APCA-API-KEY-ID", c.apiKey)
 	req.Header.Set("APCA-API-SECRET-KEY", c.apiSecret)

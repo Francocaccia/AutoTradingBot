@@ -7,7 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 )
+
+// validSymbol guards URL path/query construction against odd characters
+// coming from news feeds or LLM output.
+var validSymbol = regexp.MustCompile(`^[A-Z]{1,5}(\.[A-Z])?$`)
 
 type Side string
 
@@ -91,6 +96,11 @@ type bracketOrderRequest struct {
 	StopLoss    bracketLeg `json:"stop_loss"`
 }
 
+// bracketTimeInForce is GTC so the stop-loss and take-profit legs stay live
+// overnight; with "day" they would expire at the close and leave a swing
+// position unprotected.
+const bracketTimeInForce = "gtc"
+
 // PlaceBracketOrder submits a market entry order with attached take-profit
 // and stop-loss legs (order_class: bracket).
 func (c *AlpacaClient) PlaceBracketOrder(symbol string, qty int, side Side, stopLoss, takeProfit float64) error {
@@ -99,7 +109,7 @@ func (c *AlpacaClient) PlaceBracketOrder(symbol string, qty int, side Side, stop
 		Qty:         qty,
 		Side:        side,
 		Type:        "market",
-		TimeInForce: "day",
+		TimeInForce: bracketTimeInForce,
 		OrderClass:  "bracket",
 		TakeProfit:  bracketLeg{LimitPrice: fmt.Sprintf("%.2f", takeProfit)},
 		StopLoss:    bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
@@ -134,4 +144,60 @@ func (c *AlpacaClient) GetAccount() ([]byte, error) {
 func (c *AlpacaClient) GetClock() ([]byte, error) {
 	data, _, err := c.doRequest("GET", "/v2/clock", nil)
 	return data, err
+}
+
+// GetAsset returns Alpaca's /v2/assets/{symbol} payload (class, exchange,
+// status, tradable). A 404 is reported as ErrNotFound.
+func (c *AlpacaClient) GetAsset(symbol string) ([]byte, error) {
+	if !validSymbol.MatchString(symbol) {
+		return nil, fmt.Errorf("invalid symbol %q", symbol)
+	}
+	data, status, err := c.doRequest("GET", "/v2/assets/"+symbol, nil)
+	if err != nil {
+		if status == http.StatusNotFound {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+// GetCalendar returns the trading-calendar entry for a single date
+// (YYYY-MM-DD); the array is empty on weekends and holidays.
+func (c *AlpacaClient) GetCalendar(date string) ([]byte, error) {
+	data, _, err := c.doRequest("GET", "/v2/calendar?start="+date+"&end="+date, nil)
+	return data, err
+}
+
+// CancelOpenOrders cancels every open order for symbol (including the legs of
+// a bracket). It must run before closing a position, because shares reserved
+// by open stop/limit legs cannot be sold. Returns how many orders were
+// cancelled.
+func (c *AlpacaClient) CancelOpenOrders(symbol string) (int, error) {
+	if !validSymbol.MatchString(symbol) {
+		return 0, fmt.Errorf("invalid symbol %q", symbol)
+	}
+	data, _, err := c.doRequest("GET", "/v2/orders?status=open&limit=100&symbols="+symbol, nil)
+	if err != nil {
+		return 0, err
+	}
+	var orders []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(data, &orders); err != nil {
+		return 0, err
+	}
+	cancelled := 0
+	var firstErr error
+	for _, o := range orders {
+		if _, status, err := c.doRequest("DELETE", "/v2/orders/"+o.ID, nil); err != nil {
+			// 422 means the order already filled/cancelled (e.g. a sibling leg).
+			if status != http.StatusUnprocessableEntity && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		cancelled++
+	}
+	return cancelled, firstErr
 }

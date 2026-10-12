@@ -11,6 +11,6 @@ services:
       - key: ALPACA_API_SECRET
         sync: false
       - key: ALPACA_BASE_URL
-        value: https://paper-api.alpaca.markets/v2
+        value: https://paper-api.alpaca.markets
       - key: GEMINI_API_KEY
         sync: false

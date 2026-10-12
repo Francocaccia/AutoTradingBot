@@ -1,9 +1,11 @@
 package indicators
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"time"
 )
 
 type Result struct {
@@ -13,6 +15,12 @@ type Result struct {
 	Volume int64   `json:"volume"`
 	Beta   float64 `json:"beta"`
 	PE     float64 `json:"pe_ratio"`
+
+	ATR       float64 `json:"atr"`        // ATR(14), in dollars
+	AvgVolume float64 `json:"avg_volume"` // mean daily volume over ~60 completed sessions
+	Sector    string  `json:"sector"`     // empty when unavailable (e.g. ETFs)
+	Name      string  `json:"name"`
+	QuoteType string  `json:"quote_type"` // EQUITY, ETF, ...
 
 	Ichimoku   IchimokuResult   `json:"ichimoku"`
 	MACD       MACDResult       `json:"macd"`
@@ -45,8 +53,12 @@ type KeltnerResult struct {
 	Lower  float64 `json:"lower"`
 }
 
+const calcTimeout = 60 * time.Second
+
 func Calculate(symbol string) (*Result, error) {
-	cmd := exec.Command("python3", "python/indicators/calculate.py", symbol)
+	ctx, cancel := context.WithTimeout(context.Background(), calcTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", "python/indicators/calculate.py", symbol)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("python script failed for %s: %w", symbol, err)
