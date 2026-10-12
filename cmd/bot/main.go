@@ -29,6 +29,8 @@ const (
 	defaultMaxPositionPct   = 10.0
 	defaultMaxOpenPositions = 8
 	defaultMaxCandidates    = 5
+	defaultCycleMin         = 15
+	defaultEvalCooldownMin  = 45
 	dataDir                 = "data"
 )
 
@@ -44,6 +46,7 @@ func main() {
 	newsClient := news.NewAlpacaNewsClient(apiKey, apiSecret)
 	dataClient := marketdata.NewClient(apiKey, apiSecret)
 	geminiClient := gemini.NewClient(os.Getenv("GEMINI_API_KEY"), os.Getenv("GEMINI_FALLBACK_MODEL"))
+	geminiClient.SetLimits(envPositive("GEMINI_MAX_RPM", gemini.DefaultMaxRPM), envPositive("GEMINI_DAILY_BUDGET", gemini.DefaultDailyBudget))
 	port := portfolio.NewPortfolio(alpacaClient)
 
 	tracker, err := stats.New(dataDir)
@@ -53,6 +56,7 @@ func main() {
 
 	maxCandidates := envInt("UNIVERSE_MAX_CANDIDATES", defaultMaxCandidates)
 	uni := universe.New(coreWatchlist, maxCandidates, universe.BrokerAssets{Broker: alpacaClient}, dataClient, indicators.Calculate)
+	uni.Prefetch = indicators.Prefetch
 
 	sched := scheduler.New(scheduler.Config{
 		Broker:           alpacaClient,
@@ -66,6 +70,8 @@ func main() {
 		MaxPositionUSD:   envFloat("MAX_POSITION_USD", 0),
 		MaxOpenPositions: envInt("MAX_OPEN_POSITIONS", defaultMaxOpenPositions),
 		Debug:            strings.EqualFold(os.Getenv("LOG_LEVEL"), "debug"),
+		CycleInterval:    time.Duration(envPositive("CYCLE_INTERVAL_MIN", defaultCycleMin)) * time.Minute,
+		EvalCooldown:     time.Duration(envInt("EVAL_COOLDOWN_MIN", defaultEvalCooldownMin)) * time.Minute,
 	})
 
 	// Health endpoint so the host (Render) and an uptime monitor can reach the bot.
@@ -123,6 +129,15 @@ func envInt(name string, def int) int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 {
 		log.Printf("Invalid %s %q, using default %d", name, v, def)
+		return def
+	}
+	return n
+}
+
+// envPositive is envInt that also rejects 0.
+func envPositive(name string, def int) int {
+	n := envInt(name, def)
+	if n <= 0 {
 		return def
 	}
 	return n

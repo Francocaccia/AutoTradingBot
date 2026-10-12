@@ -243,3 +243,76 @@ func TestScreenerFailureFallsBackToNews(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestIsDerivativeSymbol(t *testing.T) {
+	for _, s := range []string{"ABCDW", "ABCWS", "ABCDR", "ABCDU"} {
+		if !IsDerivativeSymbol(s) {
+			t.Errorf("%s should be flagged", s)
+		}
+	}
+	for _, s := range []string{"AAPL", "NVDA", "GOOGL", "SW", "FOUR", "ABCW", "TSLAR1"} {
+		if IsDerivativeSymbol(s) {
+			t.Errorf("%s should not be flagged", s)
+		}
+	}
+}
+
+func TestCheckAssetRejectsWarrantsRightsUnits(t *testing.T) {
+	for _, name := range []string{"Acme Acquisition Corp Warrant", "Acme Acquisition Corp. Rights", "Acme Acquisition Corp Unit", "Acme Warrants"} {
+		a := &Asset{Name: name, Class: "us_equity", Exchange: "NASDAQ", Status: "active", Tradable: true}
+		if err := CheckAsset(a); err == nil {
+			t.Errorf("%q should be rejected", name)
+		}
+	}
+	for _, name := range []string{"United Airlines Holdings", "Rightmove plc", "Unity Software Inc."} {
+		a := &Asset{Name: name, Class: "us_equity", Exchange: "NASDAQ", Status: "active", Tradable: true}
+		if err := CheckAsset(a); err != nil {
+			t.Errorf("%q should pass: %v", name, err)
+		}
+	}
+}
+
+func TestBuildSkipsDuplicateShareClassesAndDerivatives(t *testing.T) {
+	assets := fakeAssets{
+		"SPY": asset("SPY", "ARCA"), "GOOG": asset("GOOG", "NASDAQ"), "GOOGL": asset("GOOGL", "NASDAQ"),
+		"FOXA": asset("FOXA", "NASDAQ"), "FOX": asset("FOX", "NASDAQ"), "ABCDW": asset("ABCDW", "NASDAQ"),
+		"NEWC": asset("NEWC", "NYSE"),
+	}
+	data := map[string]*indicators.Result{
+		"SPY": liquid(500), "GOOG": liquid(150), "GOOGL": liquid(149), "FOXA": liquid(40), "FOX": liquid(38),
+		"ABCDW": liquid(6), "NEWC": liquid(20),
+	}
+	u, fetched := newTestUniverse(5, assets, data, fakeScreener{actives: []string{"GOOGL", "ABCDW", "FOXA", "FOX", "NEWC"}})
+	u.Core = []string{"SPY", "GOOG"}
+	got := strings.Join(symbols(u.Build(nil)), ",")
+	if got != "SPY,GOOG,FOXA,NEWC" {
+		t.Fatalf("got %s, want SPY,GOOG,FOXA,NEWC", got)
+	}
+	for _, f := range *fetched {
+		if f == "GOOGL" || f == "ABCDW" || f == "FOX" {
+			t.Errorf("fetched data for filtered symbol %s", f)
+		}
+	}
+}
+
+func TestBuildPrefetchesPlausibleCandidatesOnce(t *testing.T) {
+	assets := fakeAssets{"SPY": asset("SPY", "ARCA"), "AAA": asset("AAA", "NASDAQ"), "OTCX": asset("OTCX", "OTC")}
+	data := map[string]*indicators.Result{"SPY": liquid(500), "AAA": liquid(20)}
+	u, _ := newTestUniverse(5, assets, data, fakeScreener{actives: []string{"OTCX", "AAA"}})
+	var batches [][]string
+	u.Prefetch = func(s []string) { batches = append(batches, s) }
+	u.Build(nil)
+	if len(batches) != 1 || strings.Join(batches[0], ",") != "AAA" {
+		t.Fatalf("want one prefetch of [AAA], got %v", batches)
+	}
+}
+
+func TestHeldShareClassBlocksCandidate(t *testing.T) {
+	assets := fakeAssets{"SPY": asset("SPY", "ARCA"), "GOOGL": asset("GOOGL", "NASDAQ")}
+	data := map[string]*indicators.Result{"SPY": liquid(500), "GOOGL": liquid(149)}
+	u, _ := newTestUniverse(5, assets, data, fakeScreener{actives: []string{"GOOGL"}})
+	u.Core = []string{"SPY", "GOOG"}
+	if got := strings.Join(symbols(u.Build(nil)), ","); got != "SPY" {
+		t.Fatalf("got %s", got)
+	}
+}

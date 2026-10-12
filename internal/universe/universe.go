@@ -84,6 +84,12 @@ type Universe struct {
 	Assets        Assets
 	Screener      Screener // optional
 	Fetch         Fetcher
+	// Prefetch optionally warms Fetch's cache for several symbols at once
+	// (one batched market-data call per cycle). May be nil.
+	Prefetch func(symbols []string)
+	// Held lists symbols currently held; a candidate whose other share class
+	// is held is skipped. Set by the scheduler each cycle.
+	Held []string
 
 	now func() time.Time
 
@@ -119,6 +125,13 @@ func (u *Universe) Suggest(symbols []string) {
 func (u *Universe) Build(newsSymbols []string) []Item {
 	var items []Item
 	seen := map[string]bool{}
+	represented := map[string]bool{} // symbols in the core list, accepted, or held
+	for _, sym := range u.Core {
+		represented[sym] = true
+	}
+	for _, sym := range u.Held {
+		represented[sym] = true
+	}
 	for _, sym := range u.Core {
 		seen[sym] = true
 		if ind, err := u.Validate(sym); err != nil {
@@ -131,7 +144,12 @@ func (u *Universe) Build(newsSymbols []string) []Item {
 	if u.MaxCandidates <= 0 {
 		return items
 	}
-	added, checks := 0, 0
+
+	// Cheap Alpaca-side checks first, so only plausible candidates reach the
+	// (batched) market-data fetch.
+	assets := map[string]*Asset{}
+	var plausible []string
+	checks := 0
 	for _, sym := range u.candidatePool(newsSymbols) {
 		if seen[sym] {
 			continue
@@ -140,11 +158,34 @@ func (u *Universe) Build(newsSymbols []string) []Item {
 		if u.isRejected(sym) {
 			continue
 		}
-		if added >= u.MaxCandidates || checks >= u.MaxCandidates*checksPerSlot {
+		if duplicateClass(sym, represented) {
+			log.Printf("[Universe] candidate %s skipped: another share class is already represented", sym)
+			continue
+		}
+		if checks >= u.MaxCandidates*checksPerSlot {
 			break
 		}
 		checks++
-		ind, err := u.Validate(sym)
+		if _, err := u.checkedAsset(sym, assets); err != nil {
+			log.Printf("[Universe] candidate %s rejected: %v", sym, err)
+			u.reject(sym)
+			continue
+		}
+		plausible = append(plausible, sym)
+	}
+	if u.Prefetch != nil && len(plausible) > 0 {
+		u.Prefetch(plausible)
+	}
+
+	added := 0
+	for _, sym := range plausible {
+		if added >= u.MaxCandidates {
+			break
+		}
+		if duplicateClass(sym, represented) { // a sibling was accepted earlier in this loop
+			continue
+		}
+		ind, err := u.validateMarket(sym, assets[sym])
 		if err != nil {
 			log.Printf("[Universe] candidate %s rejected: %v", sym, err)
 			u.reject(sym)
@@ -152,28 +193,89 @@ func (u *Universe) Build(newsSymbols []string) []Item {
 		}
 		log.Printf("[Universe] candidate %s accepted (price $%.2f, avg vol %.1fM)", sym, ind.Price, ind.AvgVolume/1e6)
 		items = append(items, Item{Symbol: sym, Ind: ind, Validated: true})
+		represented[sym] = true
 		added++
 	}
 	return items
 }
 
+// shareClasses lists tickers that are different share classes of one issuer.
+// Only one per group is added as a candidate.
+var shareClasses = [][]string{
+	{"GOOG", "GOOGL"}, {"FOX", "FOXA"}, {"NWS", "NWSA"}, {"UA", "UAA"}, {"Z", "ZG"}, {"LBTYA", "LBTYB", "LBTYK"},
+}
+
+func shareClassGroup(sym string) []string {
+	for _, g := range shareClasses {
+		if contains(g, sym) {
+			return g
+		}
+	}
+	return nil
+}
+
+// duplicateClass reports whether another share class of sym is already in held.
+func duplicateClass(sym string, held map[string]bool) bool {
+	for _, other := range shareClassGroup(sym) {
+		if other != sym && held[other] {
+			return true
+		}
+	}
+	return false
+}
+
+// IsDerivativeSymbol flags 5-letter tickers ending in W, WS, R or U, the
+// conventions for warrants, rights and units of SPACs.
+func IsDerivativeSymbol(sym string) bool {
+	if len(sym) != 5 {
+		return false
+	}
+	return strings.HasSuffix(sym, "WS") || strings.HasSuffix(sym, "W") || strings.HasSuffix(sym, "R") || strings.HasSuffix(sym, "U")
+}
+
+var derivativeNameRe = regexp.MustCompile(`(?i)\b(warrants?|rights?|units?)\b`)
+
 // Validate runs every hard filter and returns the symbol's indicators. The
 // cheap Alpaca asset checks run before the (slow) market-data fetch. A data
 // fetch failure is an error, so the symbol is skipped.
 func (u *Universe) Validate(symbol string) (*indicators.Result, error) {
+	asset, err := u.checkedAsset(symbol, nil)
+	if err != nil {
+		return nil, err
+	}
+	return u.validateMarket(symbol, asset)
+}
+
+// checkedAsset runs the symbol and Alpaca-side filters. cache (optional)
+// remembers lookups so a symbol is only fetched from Alpaca once per Build.
+func (u *Universe) checkedAsset(symbol string, cache map[string]*Asset) (*Asset, error) {
 	if !symbolRe.MatchString(symbol) {
 		return nil, fmt.Errorf("invalid symbol %q", symbol)
 	}
-	asset, err := u.Assets.GetAsset(symbol)
-	if err != nil {
-		if errors.Is(err, broker.ErrNotFound) {
-			return nil, errors.New("asset does not exist on Alpaca")
+	if IsDerivativeSymbol(symbol) {
+		return nil, fmt.Errorf("%s looks like a warrant, right or unit", symbol)
+	}
+	asset, ok := cache[symbol]
+	if !ok {
+		var err error
+		asset, err = u.Assets.GetAsset(symbol)
+		if err != nil {
+			if errors.Is(err, broker.ErrNotFound) {
+				return nil, errors.New("asset does not exist on Alpaca")
+			}
+			return nil, fmt.Errorf("asset lookup failed: %w", err)
 		}
-		return nil, fmt.Errorf("asset lookup failed: %w", err)
+		if cache != nil {
+			cache[symbol] = asset
+		}
 	}
 	if err := CheckAsset(asset); err != nil {
 		return nil, err
 	}
+	return asset, nil
+}
+
+func (u *Universe) validateMarket(symbol string, asset *Asset) (*indicators.Result, error) {
 	ind, err := u.Fetch(symbol)
 	if err != nil {
 		return nil, fmt.Errorf("market data fetch failed: %w", err)
@@ -205,6 +307,9 @@ func CheckAsset(a *Asset) error {
 	if IsLeveragedOrInverse(a.Name, false) {
 		return fmt.Errorf("leveraged/inverse product %q", a.Name)
 	}
+	if derivativeNameRe.MatchString(a.Name) {
+		return fmt.Errorf("warrant, right or unit %q", a.Name)
+	}
 	return nil
 }
 
@@ -215,6 +320,9 @@ func CheckMarket(a *Asset, ind *indicators.Result) error {
 	}
 	if ind.Price < MinPrice {
 		return fmt.Errorf("price $%.2f below $%.0f", ind.Price, MinPrice)
+	}
+	if ind.AvgVolume <= 0 {
+		return errors.New("avg daily volume unavailable")
 	}
 	if ind.AvgVolume < MinAvgVolume {
 		return fmt.Errorf("avg daily volume %.0f below %.0f", ind.AvgVolume, MinAvgVolume)

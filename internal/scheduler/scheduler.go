@@ -2,9 +2,11 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/francocaccia/quantengine/internal/broker"
@@ -37,7 +39,12 @@ type Config struct {
 	MaxPositionUSD   float64 // optional absolute cap; <= 0 disables
 	MaxOpenPositions int
 	Debug            bool // log Gemini's full reasoning
+
+	CycleInterval time.Duration // market cycle period; default 15m
+	EvalCooldown  time.Duration // min time between Gemini evaluations of a symbol; 0 disables
 }
+
+const defaultCycleInterval = 15 * time.Minute
 
 type Scheduler struct {
 	cfg        Config
@@ -47,11 +54,15 @@ type Scheduler struct {
 	sectors    map[string]string // symbol -> sector, learned from indicator fetches
 	dayHaltFor string            // session date for which the daily-loss breaker has tripped
 	paused     bool
+	gate       *evalGate
 }
 
 func New(cfg Config) *Scheduler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Scheduler{cfg: cfg, ctx: ctx, cancel: cancel, sectors: map[string]string{}}
+	if cfg.CycleInterval <= 0 {
+		cfg.CycleInterval = defaultCycleInterval
+	}
+	return &Scheduler{cfg: cfg, ctx: ctx, cancel: cancel, sectors: map[string]string{}, gate: newEvalGate(cfg.EvalCooldown)}
 }
 
 func (s *Scheduler) Pause()         { s.paused = true }
@@ -59,10 +70,11 @@ func (s *Scheduler) Resume()        { s.paused = false }
 func (s *Scheduler) IsPaused() bool { return s.paused }
 
 func (s *Scheduler) Start() {
-	log.Println("Scheduler started")
+	log.Printf("Scheduler started (cycle every %s, eval cooldown %s); first decision cycle at the next tick", s.cfg.CycleInterval, s.cfg.EvalCooldown)
+	// No decision cycle at process start: redeploys would burn Gemini quota.
 	s.fetchAndCacheNews()
 	newsTicker := time.NewTicker(4 * time.Hour)
-	marketTicker := time.NewTicker(5 * time.Minute)
+	marketTicker := time.NewTicker(s.cfg.CycleInterval)
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -142,6 +154,26 @@ type cycleState struct {
 	sectorValue map[string]float64
 	buyBlock    string // non-empty: no new BUYs this cycle, with the reason
 	warnedNoSec map[string]bool
+
+	stopGemini   bool // Gemini quota/budget hit: no more decisions this cycle
+	evaluated    int
+	skipCooldown int
+	skipNoSetup  int
+}
+
+// headlinesFor returns the cached headlines that mention symbol (no
+// general-news fallback); the evaluation gate uses them to detect new news.
+func (s *Scheduler) headlinesFor(symbol string) []string {
+	var out []string
+	for _, a := range s.newsCache {
+		for _, sym := range a.Symbols {
+			if sym == symbol {
+				out = append(out, a.Headline)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (s *Scheduler) runMarketCycle() {
@@ -160,6 +192,15 @@ func (s *Scheduler) runMarketCycle() {
 		return
 	}
 	log.Println("[Market] Open — running decision cycle")
+
+	// With Gemini paused (daily quota or local budget) no decisions are made.
+	// Stops and take-profits live in server-side bracket orders and end-of-day
+	// reporting runs on the closed-market path, so both keep working.
+	if paused, why := s.cfg.Gemini.Paused(); paused {
+		used, budget := s.cfg.Gemini.Usage()
+		log.Printf("[Gemini] paused (%s, %d/%d calls) — no decisions this cycle; bracket orders stay active", why, used, budget)
+		return
+	}
 
 	acct, err := s.cfg.Portfolio.GetAccount()
 	if err != nil {
@@ -189,28 +230,58 @@ func (s *Scheduler) runMarketCycle() {
 		log.Printf("[Risk] new BUYs blocked: %s (SELL/exits still active)", cs.buyBlock)
 	}
 
+	// The bot manages every open position, whether or not it is in the core
+	// list or the candidate pool. Held symbols go first so they win when the
+	// Gemini budget is tight.
+	held := make([]string, 0, len(cs.positions))
+	for sym := range cs.positions {
+		held = append(held, sym)
+	}
+	sort.Strings(held)
+	isHeld := map[string]bool{}
+	for _, sym := range held {
+		isHeld[sym] = true
+	}
+	s.cfg.Universe.Held = held
+	indicators.Prefetch(append(append([]string{}, s.cfg.Universe.Core...), held...)) // one batched fetch
+
 	items := s.cfg.Universe.Build(s.newsSymbols())
-	inUniverse := map[string]bool{}
-	for _, it := range items {
-		inUniverse[it.Symbol] = true
-		s.noteSector(it.Symbol, it.Ind)
-		s.evaluate(it.Symbol, it.Ind, false, cs)
+	inUniverse := map[string]*universe.Item{}
+	for i := range items {
+		inUniverse[items[i].Symbol] = &items[i]
+		s.noteSector(items[i].Symbol, items[i].Ind)
 	}
 
-	// Held positions that fell out of the universe (or failed the filters,
-	// e.g. dropped below $5) must still be managed, but never bought.
-	for sym := range cs.positions {
-		if inUniverse[sym] {
+	for _, sym := range held {
+		if cs.stopGemini {
+			break
+		}
+		if it := inUniverse[sym]; it != nil {
+			s.evaluate(sym, it.Ind, false, cs)
 			continue
 		}
+		// Outside the universe or failing the BUY filters (e.g. a low-volume
+		// ETF): still managed, SELL-only. The filters gate new positions only.
 		ind, err := indicators.Calculate(sym)
 		if err != nil {
-			log.Printf("[%s] Indicators error for held position: %v", sym, err)
+			log.Printf("[%s] WARNING: indicators unavailable for held position: %v — existing bracket orders left untouched", sym, err)
 			continue
 		}
 		s.noteSector(sym, ind)
 		s.evaluate(sym, ind, true, cs)
 	}
+	for _, it := range items {
+		if cs.stopGemini {
+			break
+		}
+		if !isHeld[it.Symbol] {
+			s.evaluate(it.Symbol, it.Ind, false, cs)
+		}
+	}
+
+	used, budget := s.cfg.Gemini.Usage()
+	log.Printf("[Cycle] evaluated=%d skipped(cooldown)=%d skipped(no setup)=%d | [Gemini] calls today: %d/%d",
+		cs.evaluated, cs.skipCooldown, cs.skipNoSetup, used, budget)
 }
 
 // checkBuyBlock applies the circuit breakers and the open/close buffer and
@@ -257,6 +328,23 @@ func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly boo
 		return
 	}
 
+	in := evalInput{Symbol: symbol, Held: position != nil, Price: ind.Price, RSI: ind.RSI, Headlines: s.headlinesFor(symbol), Now: time.Now()}
+	ok, skip, why := s.gate.Check(in)
+	if !ok {
+		if skip == "no setup" {
+			cs.skipNoSetup++
+		} else {
+			cs.skipCooldown++
+		}
+		if s.cfg.Debug {
+			log.Printf("[%s] skipped (%s)", symbol, skip)
+		}
+		return
+	}
+	if s.cfg.Debug {
+		log.Printf("[%s] evaluating: %s", symbol, why)
+	}
+
 	stop := 0.0
 	if l, err := risk.Bracket(ind.Price, ind.ATR, 0); err == nil {
 		stop = l.Stop
@@ -270,9 +358,16 @@ func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly boo
 	})
 	decision, err := s.cfg.Gemini.Decide(prompt)
 	if err != nil {
+		if errors.Is(err, gemini.ErrQuotaExhausted) || errors.Is(err, gemini.ErrBudgetExhausted) {
+			cs.stopGemini = true
+			log.Printf("[%s] Gemini unavailable (%v) — no more decisions this cycle", symbol, err)
+			return
+		}
 		log.Printf("[%s] Gemini error: %v", symbol, err)
 		return
 	}
+	cs.evaluated++
+	s.gate.Record(in)
 	if decision.Conviction < 0 {
 		decision.Conviction = 0
 	} else if decision.Conviction > 10 {

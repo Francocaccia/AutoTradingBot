@@ -1,18 +1,21 @@
 # AutoTradingBot
 
-An autonomous paper-trading bot written in Go. Every five minutes during US market hours it combines technical indicators, recent news and an LLM (Gemini 2.5 Flash) to decide whether to **BUY**, **SELL** or **HOLD** each symbol in a core watchlist plus a few screened candidates, and executes the decision through Alpaca's paper-trading API. It is **long-only**: no shorting, margin, leverage or options.
+An autonomous paper-trading bot written in Go. Every 15 minutes (configurable) during US market hours it combines technical indicators, recent news and an LLM (Gemini 2.5 Flash) to decide whether to **BUY**, **SELL** or **HOLD** each symbol in a core watchlist plus a few screened candidates, and executes the decision through Alpaca's paper-trading API. It is **long-only**: no shorting, margin, leverage or options.
 
 > **Paper trading only.** This is a personal/educational/portfolio project, not financial advice. It has not been backtested and should not be pointed at a live account.
 
 ## How it works
 
 ```
-every 5 min (Mon–Fri, market hours per Alpaca's clock/calendar)
+every CYCLE_INTERVAL_MIN (default 15) min (Mon–Fri, market hours per Alpaca's clock/calendar)
+  [no cycle at process start: the first one runs at the next tick]
   ├─ account + positions → circuit breakers, open/close buffer
   ├─ universe = core watchlist + up to N validated candidates
   │     (Alpaca screener, tickers in cached news, Gemini suggestions)
+  ├─ held positions first (all of them, core or not), then universe symbols
   └─ for each symbol
-       ├─ Python (yfinance) → RSI, Ichimoku, MACD, Stochastic, Keltner, ATR, volume, sector
+       ├─ Python (one batched call per cycle) → RSI, Ichimoku, MACD, Stochastic, Keltner, ATR, volume
+       ├─ gate: per-symbol cooldown + exceptions, prefilter for quiet non-held symbols
        ├─ position, news for the symbol
        ├─ prompt → Gemini → {action, conviction 1-10, thesis, reasoning, suggested_tickers}
        └─ BUY  → size by conviction, ATR bracket (stop + take-profit), R:R >= 2
@@ -28,7 +31,7 @@ Each decision logs one line, `[SYM] ACTION conviction=N | thesis`; set `LOG_LEVE
 ## Stack
 
 - **Go 1.22**: scheduler, Alpaca and Gemini clients, order execution
-- **Python 3.11** (`yfinance`, `pandas`): indicator calculation, called from Go as a subprocess
+- **Python 3.11** (`yfinance`, `pandas`): indicator calculation, called from Go as a subprocess. Daily bars come from Alpaca market data (IEX feed, free) with a batched `yfinance` fallback; `yfinance` supplies fundamentals (beta, P/E, sector, average volume)
 - **Alpaca Markets** paper API: orders, positions, news
 - **Google Gemini 2.5 Flash**: decision engine
 - **Docker** and **Render**: deployment
@@ -37,7 +40,7 @@ Each decision logs one line, `[SYM] ACTION conviction=N | thesis`; set `LOG_LEVE
 
 ```
 cmd/bot/                 entrypoint, health endpoint, graceful shutdown
-internal/scheduler/      5-minute market cycle, order flow, daily stats trigger
+internal/scheduler/      market cycle, evaluation gate (cooldown/prefilter), order flow, daily stats trigger
 internal/broker/         Alpaca REST client (orders, positions, assets, calendar)
 internal/news/           Alpaca News client
 internal/marketdata/     Alpaca screener and SPY daily-bar snapshot
@@ -71,6 +74,10 @@ go run ./cmd/bot
 | `MAX_POSITION_USD` | Optional absolute cap per position in USD; unset or `0` disables it |
 | `MAX_OPEN_POSITIONS` | Max simultaneous open positions (default `8`) |
 | `UNIVERSE_MAX_CANDIDATES` | Extra screened candidates per cycle on top of the core watchlist (default `5`; `0` disables the dynamic universe) |
+| `GEMINI_MAX_RPM` | Global cap on Gemini requests per minute, retries included; calls wait for room (default `8`) |
+| `GEMINI_DAILY_BUDGET` | Max Gemini requests per day (America/Los_Angeles day), retries included; decisions pause when spent (default `200`) |
+| `EVAL_COOLDOWN_MIN` | A symbol is sent to Gemini at most once per this many minutes, unless price moved >2%, RSI crossed 30/70, or new news mentions it; `0` disables (default `45`) |
+| `CYCLE_INTERVAL_MIN` | Minutes between market cycles (default `15`) |
 | `LOG_LEVEL` | `debug` also logs Gemini's full reasoning; anything else logs one line per decision (default `info`) |
 | `PORT` | Port for the `/health` and `/stats` endpoints (default `8080`) |
 
@@ -84,7 +91,16 @@ The core watchlist (SPY, QQQ, AAPL, MSFT, NVDA, AMZN, GOOG) is always evaluated.
 - not a leveraged or inverse ETF by name
 - market data fetch succeeded (otherwise the symbol is skipped and logged)
 
-Positions already held that drop out of the universe are still evaluated, SELL-only.
+Filters also reject warrants, rights and units (Alpaca asset name containing "Warrant", "Right" or "Unit", and 5-letter tickers ending in W, WS, R or U) and skip a candidate whose other share class is already represented (e.g. GOOGL when GOOG is in the core list).
+
+The filters apply **only to opening new positions**. The bot manages every position in the account: each held symbol is added to the evaluation set automatically, evaluated for SELL on the cooldown schedule even if it is not in the core list or candidate pool, and can be sold even if it fails the BUY filters (e.g. a held low-volume ETF).
+
+## Gemini quota and call volume
+
+- Every request, retries included, passes a global rate limiter (`GEMINI_MAX_RPM`) and a daily budget (`GEMINI_DAILY_BUDGET`); the running count is logged once per cycle.
+- HTTP 429 with "quota" in the body (and no per-minute marker) is a daily limit: it is **not retried**. The bot logs `[Gemini] daily quota exhausted, pausing until reset` once and makes no Gemini calls until 00:00 America/Los_Angeles. Other 429s (per-minute) are retried, honoring `Retry-After`; 500, 503 and empty responses keep their retries.
+- While paused, cycles still run reporting, and stops/take-profits keep working because they are server-side bracket orders, but no decisions are made.
+- Held positions are evaluated before candidates, so they win when the budget is tight. Non-held symbols with RSI between 40 and 60 and no new news are skipped without calling Gemini.
 
 ## Risk controls
 
@@ -115,7 +131,10 @@ The included `Dockerfile` builds the Go binary on top of a Python image. `render
 
 ## Known limitations
 
-- Indicators use daily bars but the loop runs every five minutes, so consecutive cycles often see near-identical data.
+- **Gemini free-tier quota** is small (a few hundred requests per day per model, and low per-minute limits). The cooldown, prefilter, rate limiter and daily budget keep usage below it, but a busy account with many held positions can still exhaust it; decisions then pause until 00:00 Pacific.
+- **Yahoo rate limits on cloud IPs:** Yahoo often throttles shared hosting IPs (Render included). Technicals therefore come from Alpaca's free IEX bars, cached 10 minutes; only fundamentals (beta, P/E, sector, average volume) use Yahoo, cached 24 hours. If Yahoo fails, indicators still work but average volume is unknown, so new symbols fail the liquidity filter until fundamentals load (held positions are still evaluated and sold). Data failures for a held position log a WARNING and leave its bracket orders untouched.
+- IEX volume covers only a fraction of market volume, which is why liquidity uses Yahoo's average volume rather than the bars.
+- Indicators use daily bars but the loop runs every 15 minutes, so consecutive cycles often see near-identical data.
 - No backtesting and no persistence of decisions beyond logs.
 - Ichimoku Span A/B read as 0 because three months of daily bars is too short for the 52-period spans shifted by 26.
 

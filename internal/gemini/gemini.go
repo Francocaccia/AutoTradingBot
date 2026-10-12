@@ -8,7 +8,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/francocaccia/quantengine/internal/indicators"
@@ -20,6 +22,18 @@ const (
 	defaultBaseURL = "https://generativelanguage.googleapis.com/v1/models"
 	primaryModel   = "gemini-2.5-flash"
 	maxRetries     = 3
+
+	DefaultMaxRPM      = 8
+	DefaultDailyBudget = 200
+	maxRetryAfter      = 60 * time.Second
+)
+
+var (
+	// ErrQuotaExhausted means Gemini returned a daily-quota 429 (or the
+	// client is still paused from one). Never retried.
+	ErrQuotaExhausted = errors.New("gemini daily quota exhausted")
+	// ErrBudgetExhausted means the local GEMINI_DAILY_BUDGET was used up.
+	ErrBudgetExhausted = errors.New("gemini daily call budget exhausted")
 )
 
 // retryDelays are the waits before retry 1, 2 and 3.
@@ -32,6 +46,15 @@ type Client struct {
 	baseURL       string
 	http          *http.Client
 	sleep         func(time.Duration) // overridden in tests
+	now           func() time.Time    // overridden in tests
+
+	mu          sync.Mutex
+	maxRPM      int
+	dailyBudget int
+	window      []time.Time // request times within the last minute
+	dayKey      string      // America/Los_Angeles date the counters belong to
+	used        int         // requests sent today (retries included)
+	exhausted   bool        // daily quota 429 seen; cleared at the next LA midnight
 }
 
 // NewClient builds a Gemini client. fallbackModel (e.g. gemini-2.5-flash-lite)
@@ -45,7 +68,119 @@ func NewClient(apiKey, fallbackModel string) *Client {
 		baseURL:       defaultBaseURL,
 		http:          &http.Client{Timeout: 90 * time.Second},
 		sleep:         time.Sleep,
+		now:           time.Now,
+		maxRPM:        DefaultMaxRPM,
+		dailyBudget:   DefaultDailyBudget,
 	}
+}
+
+// SetLimits sets the global requests-per-minute cap and the daily call
+// budget. Non-positive values keep the current setting.
+func (c *Client) SetLimits(maxRPM, dailyBudget int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if maxRPM > 0 {
+		c.maxRPM = maxRPM
+	}
+	if dailyBudget > 0 {
+		c.dailyBudget = dailyBudget
+	}
+}
+
+// quotaLoc is the zone in which Google resets Gemini's daily quota.
+func quotaLoc() *time.Location {
+	if loc, err := time.LoadLocation("America/Los_Angeles"); err == nil {
+		return loc
+	}
+	return time.FixedZone("PST", -8*3600)
+}
+
+// rollDay resets the daily counters and the exhausted flag once the LA date
+// changes. Caller holds c.mu.
+func (c *Client) rollDay(now time.Time) {
+	key := now.In(quotaLoc()).Format("2006-01-02")
+	if key != c.dayKey {
+		c.dayKey, c.used, c.exhausted = key, 0, false
+	}
+}
+
+// Paused reports whether Gemini calls must be skipped until the next reset:
+// the daily quota 429 was hit or the local budget is spent. The reason is
+// empty when not paused.
+func (c *Client) Paused() (bool, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rollDay(c.now())
+	switch {
+	case c.exhausted:
+		return true, "daily quota exhausted"
+	case c.used >= c.dailyBudget:
+		return true, "daily call budget used"
+	}
+	return false, ""
+}
+
+// Usage returns the requests sent today and the daily budget.
+func (c *Client) Usage() (used, budget int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rollDay(c.now())
+	return c.used, c.dailyBudget
+}
+
+// acquire reserves one request: it enforces the daily budget and blocks until
+// the per-minute window has room. Every HTTP request, retries included, goes
+// through it.
+func (c *Client) acquire() error {
+	for {
+		c.mu.Lock()
+		now := c.now()
+		c.rollDay(now)
+		if c.exhausted {
+			c.mu.Unlock()
+			return ErrQuotaExhausted
+		}
+		if c.used >= c.dailyBudget {
+			c.mu.Unlock()
+			return ErrBudgetExhausted
+		}
+		cut := now.Add(-time.Minute)
+		i := 0
+		for i < len(c.window) && !c.window[i].After(cut) {
+			i++
+		}
+		c.window = c.window[i:]
+		if len(c.window) < c.maxRPM {
+			c.window = append(c.window, now)
+			c.used++
+			c.mu.Unlock()
+			return nil
+		}
+		wait := c.window[0].Add(time.Minute).Sub(now)
+		c.mu.Unlock()
+		c.sleep(wait + 50*time.Millisecond)
+	}
+}
+
+// markExhausted sets the daily-quota flag, logging only on the transition.
+func (c *Client) markExhausted() {
+	c.mu.Lock()
+	first := !c.exhausted
+	c.exhausted = true
+	c.mu.Unlock()
+	if first {
+		log.Printf("[Gemini] daily quota exhausted, pausing until reset (00:00 America/Los_Angeles)")
+	}
+}
+
+// isDailyQuota tells a daily-limit 429 from a per-minute rate limit: the body
+// mentions "quota" without a per-minute marker.
+func isDailyQuota(body string) bool {
+	b := strings.ToLower(body)
+	if !strings.Contains(b, "quota") {
+		return false
+	}
+	return !strings.Contains(b, "perminute") && !strings.Contains(b, "per minute")
 }
 
 type Decision struct {
@@ -159,8 +294,9 @@ type geminiResponse struct {
 // retryableError marks failures worth retrying: HTTP 429/500/503 and an
 // empty response. status is the label used in the retry log line.
 type retryableError struct {
-	status string
-	err    error
+	status     string
+	err        error
+	retryAfter time.Duration // from Retry-After; 0 if absent
 }
 
 func (e *retryableError) Error() string { return e.err.Error() }
@@ -179,15 +315,22 @@ func (c *Client) Decide(prompt string) (*Decision, error) {
 		}
 		var re *retryableError
 		if !errors.As(err, &re) {
-			return nil, err // non-retryable: other 4xx, bad JSON, network error
+			return nil, err // non-retryable: daily quota, other 4xx, bad JSON, network error
 		}
 		if attempt >= maxRetries {
 			break
 		}
-		log.Printf("[Gemini] retry %d/%d after %s", attempt+1, maxRetries, re.status)
-		c.sleep(retryDelays[attempt])
+		delay := retryDelays[attempt]
+		if re.retryAfter > 0 {
+			delay = re.retryAfter
+		}
+		log.Printf("[Gemini] retry %d/%d after %s (waiting %s)", attempt+1, maxRetries, re.status, delay)
+		c.sleep(delay)
 	}
 
+	if p, _ := c.Paused(); p {
+		return nil, err
+	}
 	if c.fallbackModel != "" && c.fallbackModel != c.model {
 		log.Printf("[Gemini] %s failed after %d retries (%v); trying fallback model %s", c.model, maxRetries, err, c.fallbackModel)
 		d, ferr := c.callOnce(c.fallbackModel, prompt)
@@ -200,6 +343,9 @@ func (c *Client) Decide(prompt string) (*Decision, error) {
 }
 
 func (c *Client) callOnce(model, prompt string) (*Decision, error) {
+	if err := c.acquire(); err != nil {
+		return nil, err
+	}
 	reqBody, _ := json.Marshal(geminiRequest{
 		Contents: []geminiContent{{Parts: []geminiPart{{Text: prompt}}}},
 	})
@@ -219,7 +365,17 @@ func (c *Client) callOnce(model, prompt string) (*Decision, error) {
 	body, _ := io.ReadAll(resp.Body)
 
 	switch resp.StatusCode {
-	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable:
+	case http.StatusTooManyRequests:
+		if isDailyQuota(string(body)) {
+			c.markExhausted()
+			return nil, fmt.Errorf("%w: %s", ErrQuotaExhausted, truncate(string(body), 300))
+		}
+		return nil, &retryableError{
+			status:     "HTTP 429",
+			err:        fmt.Errorf("gemini HTTP 429: %s", truncate(string(body), 300)),
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
+	case http.StatusInternalServerError, http.StatusServiceUnavailable:
 		return nil, &retryableError{
 			status: fmt.Sprintf("HTTP %d", resp.StatusCode),
 			err:    fmt.Errorf("gemini HTTP %d: %s", resp.StatusCode, truncate(string(body), 300)),
@@ -259,6 +415,19 @@ func parseDecision(text string) (*Decision, error) {
 	}
 	decision.Action = strings.ToUpper(strings.TrimSpace(decision.Action))
 	return &decision, nil
+}
+
+// parseRetryAfter reads a Retry-After header in seconds, capped at a minute.
+func parseRetryAfter(v string) time.Duration {
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	d := time.Duration(secs) * time.Second
+	if d > maxRetryAfter {
+		d = maxRetryAfter
+	}
+	return d
 }
 
 func truncate(s string, n int) string {

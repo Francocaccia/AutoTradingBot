@@ -1,10 +1,32 @@
-import sys
-import json
-import warnings
-warnings.filterwarnings("ignore")
+"""Indicator / fundamentals worker.
 
-import yfinance as yf
+Usage:
+    calculate.py bars SYM [SYM ...]          technicals for all symbols, one batched fetch
+    calculate.py fundamentals SYM [SYM ...]  beta, P/E, sector, name, average volume (yfinance)
+
+Contract with the Go caller: stdout carries exactly one JSON object and nothing
+else ({"SYM": {...} | {"error": "..."}} or a top-level {"error": "..."});
+warnings and logging go to stderr; the exit code is 0 even on failure.
+"""
+import sys
+import os
+import io
+import json
+import time
+import random
+import logging
+import warnings
+import urllib.request
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+warnings.filterwarnings("ignore")
+logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+
 import pandas as pd
+
+MIN_BARS = 52
+RATE_LIMIT_MARKERS = ("too many requests", "rate limit", "429", "yfratelimit")
 
 
 def safe(value):
@@ -104,49 +126,166 @@ def rsi(close, length=14):
     return round(safe((100 - 100 / (1 + rs)).iloc[-1]), 4)
 
 
-def main():
-    if len(sys.argv) < 2:
-        print(json.dumps({"error": "no symbol"}))
-        sys.exit(1)
+def is_rate_limited(exc):
+    text = (type(exc).__name__ + " " + str(exc)).lower()
+    return any(m in text for m in RATE_LIMIT_MARKERS)
 
-    symbol = sys.argv[1].upper()
 
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="3mo", interval="1d")
-
-        if df.empty or len(df) < 52:
-            print(json.dumps({"error": f"not enough data for {symbol}"}))
-            sys.exit(1)
-
+def with_retry(fn, attempts=3, base=2.0):
+    """Call fn(); on a rate-limit error back off with jitter and retry."""
+    for i in range(attempts):
         try:
-            info = ticker.info or {}
-        except Exception:
-            info = {}
-        price = round(safe(df["Close"].iloc[-1]), 4)
-        vol   = int(df["Volume"].iloc[-1])
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if i == attempts - 1 or not is_rate_limited(exc):
+                raise
+            delay = base * (2 ** i) + random.uniform(0, 1.5)
+            print(f"rate limited ({exc}); retrying in {delay:.1f}s", file=sys.stderr)
+            time.sleep(delay)
 
-        print(json.dumps({
-            "symbol":   symbol,
-            "price":    price,
-            "volume":   vol,
-            "rsi":      rsi(df["Close"]),
-            "beta":     round(float(info.get("beta") or 0), 4),
-            "pe_ratio": round(float(info.get("trailingPE") or 0), 4),
-            "atr":        atr(df),
-            "avg_volume": avg_volume(df),
-            "sector":     info.get("sector") or "",
-            "name":       info.get("longName") or info.get("shortName") or "",
-            "quote_type": info.get("quoteType") or "",
-            "ichimoku":   ichimoku(df),
-            "macd":       macd(df["Close"]),
-            "stochastic": stochastic(df),
-            "keltner":    keltner(df),
-        }))
 
-    except Exception as e:
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
+def technicals(symbol, df, source):
+    if df is None or df.empty:
+        raise ValueError(f"no data for {symbol}")
+    df = df.dropna(subset=["Close"])
+    if len(df) < MIN_BARS:
+        raise ValueError(f"not enough data for {symbol} ({len(df)} bars)")
+    return {
+        "symbol":     symbol,
+        "source":     source,
+        "price":      round(safe(df["Close"].iloc[-1]), 4),
+        "volume":     int(df["Volume"].iloc[-1]),
+        "rsi":        rsi(df["Close"]),
+        "atr":        atr(df),
+        "avg_volume": avg_volume(df),
+        "ichimoku":   ichimoku(df),
+        "macd":       macd(df["Close"]),
+        "stochastic": stochastic(df),
+        "keltner":    keltner(df),
+    }
+
+
+def alpaca_bars(symbols):
+    """Daily bars from Alpaca market data (IEX feed, free). {sym: DataFrame}."""
+    key = os.environ.get("ALPACA_API_KEY", "")
+    secret = os.environ.get("ALPACA_API_SECRET", "")
+    if not key or not secret:
+        raise RuntimeError("ALPACA_API_KEY/ALPACA_API_SECRET not set")
+    start = (datetime.now(timezone.utc) - timedelta(days=130)).strftime("%Y-%m-%d")
+    rows = {s: [] for s in symbols}
+    token = None
+    while True:
+        params = {"symbols": ",".join(symbols), "timeframe": "1Day", "start": start,
+                  "limit": 10000, "adjustment": "split", "feed": "iex"}
+        if token:
+            params["page_token"] = token
+        req = urllib.request.Request(
+            "https://data.alpaca.markets/v2/stocks/bars?" + urllib.parse.urlencode(params),
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for sym, bars in (data.get("bars") or {}).items():
+            rows.setdefault(sym, []).extend(bars)
+        token = data.get("next_page_token")
+        if not token:
+            break
+    out = {}
+    for sym, bars in rows.items():
+        if bars:
+            df = pd.DataFrame(bars).rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+            out[sym] = df[["Open", "High", "Low", "Close", "Volume"]].reset_index(drop=True)
+    return out
+
+
+def yahoo_bars(symbols):
+    """One batched yf.download for all symbols. {sym: DataFrame}."""
+    import yfinance as yf
+
+    def fetch():
+        return yf.download(list(symbols), period="3mo", interval="1d", group_by="ticker",
+                           threads=False, progress=False, auto_adjust=False)
+
+    raw = with_retry(fetch)
+    out = {}
+    for sym in symbols:
+        try:
+            df = raw[sym] if len(symbols) > 1 else raw
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df[sym] if sym in df.columns.get_level_values(0) else df.droplevel(0, axis=1)
+            out[sym] = df.dropna(how="all")
+        except KeyError:
+            pass
+    return out
+
+
+def cmd_bars(symbols):
+    results, frames, source = {}, {}, "alpaca-iex"
+    try:
+        frames = alpaca_bars(symbols)
+    except Exception as exc:  # noqa: BLE001
+        print(f"alpaca bars failed ({exc}); falling back to yfinance", file=sys.stderr)
+    missing = [s for s in symbols if s not in frames or len(frames[s]) < MIN_BARS]
+    if missing:
+        try:
+            for sym, df in yahoo_bars(missing).items():
+                frames[sym] = df
+                results[sym] = ("yfinance", df)
+        except Exception as exc:  # noqa: BLE001
+            print(f"yfinance bars failed: {exc}", file=sys.stderr)
+            for sym in missing:
+                results.setdefault(sym, ("error", f"bars unavailable: {exc}"))
+    out = {}
+    for sym in symbols:
+        kind, payload = results.get(sym, (source, frames.get(sym)))
+        try:
+            if kind == "error":
+                raise RuntimeError(payload)
+            out[sym] = technicals(sym, frames.get(sym), kind)
+        except Exception as exc:  # noqa: BLE001
+            out[sym] = {"error": str(exc)}
+    return out
+
+
+def cmd_fundamentals(symbols):
+    import yfinance as yf
+
+    out = {}
+    for i, sym in enumerate(symbols):
+        if i:
+            time.sleep(random.uniform(0.3, 1.0))  # jitter between per-ticker requests
+        try:
+            info = with_retry(lambda: yf.Ticker(sym).info) or {}
+            out[sym] = {
+                "beta":       round(float(info.get("beta") or 0), 4),
+                "pe_ratio":   round(float(info.get("trailingPE") or 0), 4),
+                "avg_volume": float(info.get("averageVolume") or 0),
+                "sector":     info.get("sector") or "",
+                "name":       info.get("longName") or info.get("shortName") or "",
+                "quote_type": info.get("quoteType") or "",
+            }
+        except Exception as exc:  # noqa: BLE001
+            out[sym] = {"error": str(exc)}
+    return out
+
+
+def main():
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr  # stray prints from libraries must not corrupt the JSON
+    try:
+        if len(sys.argv) < 3 or sys.argv[1] not in ("bars", "fundamentals"):
+            raise ValueError("usage: calculate.py bars|fundamentals SYMBOL [SYMBOL ...]")
+        symbols = []
+        for a in sys.argv[2:]:
+            a = a.upper()
+            if a not in symbols:
+                symbols.append(a)
+        result = cmd_bars(symbols) if sys.argv[1] == "bars" else cmd_fundamentals(symbols)
+    except BaseException as exc:  # noqa: BLE001
+        result = {"error": f"{type(exc).__name__}: {exc}"}
+    sys.stdout = real_stdout
+    sys.stdout.write(json.dumps(result))
+    sys.stdout.flush()
+    sys.exit(0)
 
 
 if __name__ == "__main__":

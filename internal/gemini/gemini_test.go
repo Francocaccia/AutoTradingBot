@@ -1,12 +1,14 @@
 package gemini
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/francocaccia/quantengine/internal/indicators"
 	"github.com/francocaccia/quantengine/internal/portfolio"
@@ -149,4 +151,118 @@ func equalDurations(a, b []time.Duration) bool {
 		}
 	}
 	return true
+}
+
+const quotaBody = `{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}`
+
+func TestQuota429IsNotRetriedAndPausesUntilLAMidnight(t *testing.T) {
+	c, paths, sleeps := newTestClient(t, "fallback-model", []step{{429, quotaBody}, {200, okBody}})
+	clock := time.Date(2026, 10, 12, 18, 0, 0, 0, time.UTC) // 11:00 in Los Angeles
+	c.now = func() time.Time { return clock }
+
+	_, err := c.Decide("p")
+	if !errors.Is(err, ErrQuotaExhausted) {
+		t.Fatalf("want ErrQuotaExhausted, got %v", err)
+	}
+	if len(*paths) != 1 || len(*sleeps) != 0 {
+		t.Fatalf("quota 429 must not retry or fall back: %d requests, sleeps %v", len(*paths), *sleeps)
+	}
+	if p, _ := c.Paused(); !p {
+		t.Fatal("client should be paused")
+	}
+
+	// While paused no request is sent, even hours later on the same LA day.
+	clock = time.Date(2026, 10, 13, 6, 59, 0, 0, time.UTC) // 23:59 PDT
+	if _, err := c.Decide("p"); !errors.Is(err, ErrQuotaExhausted) {
+		t.Fatalf("want pause error, got %v", err)
+	}
+	if len(*paths) != 1 {
+		t.Fatalf("paused client sent a request: %v", *paths)
+	}
+
+	// After 00:00 America/Los_Angeles the flag clears and calls resume.
+	clock = time.Date(2026, 10, 13, 7, 1, 0, 0, time.UTC) // 00:01 PDT
+	if p, _ := c.Paused(); p {
+		t.Fatal("pause should clear after LA midnight")
+	}
+	if _, err := c.Decide("p"); err != nil {
+		t.Fatal(err)
+	}
+	if len(*paths) != 2 {
+		t.Fatalf("want 2 requests, got %d", len(*paths))
+	}
+}
+
+func TestPerMinute429HonorsRetryAfter(t *testing.T) {
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if n == 1 {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(429)
+			w.Write([]byte(`{"error":{"message":"Quota exceeded for metric GenerateRequestsPerMinutePerProjectPerModel"}}`))
+			return
+		}
+		w.Write([]byte(okBody))
+	}))
+	defer srv.Close()
+	var sleeps []time.Duration
+	c := NewClient("key", "")
+	c.baseURL = srv.URL
+	c.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
+	if _, err := c.Decide("p"); err != nil {
+		t.Fatal(err)
+	}
+	if !equalDurations(sleeps, []time.Duration{7 * time.Second}) {
+		t.Fatalf("sleeps %v, want [7s]", sleeps)
+	}
+	if p, _ := c.Paused(); p {
+		t.Fatal("per-minute limit must not pause the client")
+	}
+}
+
+func TestDailyBudgetCountsRetriesAndResets(t *testing.T) {
+	c, paths, _ := newTestClient(t, "", []step{{503, `{}`}, {200, okBody}})
+	clock := time.Date(2026, 10, 12, 18, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return clock }
+	c.SetLimits(100, 3)
+
+	if _, err := c.Decide("p"); err != nil { // 503 + 200 = 2 requests
+		t.Fatal(err)
+	}
+	if used, budget := c.Usage(); used != 2 || budget != 3 {
+		t.Fatalf("usage %d/%d, want 2/3", used, budget)
+	}
+	if _, err := c.Decide("p"); err != nil { // third request
+		t.Fatal(err)
+	}
+	if _, err := c.Decide("p"); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("want ErrBudgetExhausted, got %v", err)
+	}
+	if len(*paths) != 3 {
+		t.Fatalf("budget cap exceeded: %d requests", len(*paths))
+	}
+	if p, why := c.Paused(); !p || why == "" {
+		t.Fatal("budget exhaustion should report paused")
+	}
+	clock = clock.Add(24 * time.Hour)
+	if used, _ := c.Usage(); used != 0 {
+		t.Fatalf("counter not reset on new LA day: %d", used)
+	}
+}
+
+func TestRateLimiterWaitsForWindow(t *testing.T) {
+	c, _, sleeps := newTestClient(t, "", []step{{200, okBody}})
+	clock := time.Date(2026, 10, 12, 18, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return clock }
+	c.sleep = func(d time.Duration) { *sleeps = append(*sleeps, d); clock = clock.Add(d) }
+	c.SetLimits(2, 100)
+	for i := 0; i < 3; i++ {
+		if _, err := c.Decide("p"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(*sleeps) != 1 || (*sleeps)[0] < time.Minute {
+		t.Fatalf("third call within a minute should wait ~60s, sleeps %v", *sleeps)
+	}
 }
