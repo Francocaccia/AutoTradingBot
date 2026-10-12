@@ -2,102 +2,182 @@ package stats
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
+	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func near(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
 
-func TestRecordDayCumulativeAndPersistence(t *testing.T) {
-	dir := t.TempDir()
-	tr, err := New(dir)
-	if err != nil {
-		t.Fatal(err)
+func TestReturnAndDrawdownMath(t *testing.T) {
+	series := []float64{100, 110, 99, 105, 120, 90}
+	if got := pctChange(series[len(series)-1], series[0]); !near(got, -10) {
+		t.Errorf("return = %v, want -10", got)
 	}
-
-	// Day 1 fixes the baselines: equity 100k, SPY 500.
-	r1, err := tr.RecordDay("2026-10-12", 101_000, 100_000, 505, 500, 3)
-	if err != nil {
-		t.Fatal(err)
+	// Peak 120 -> trough 90 is -25%; the earlier 110 -> 99 dip is only -10%.
+	if got := maxDrawdown(series); !near(got, -25) {
+		t.Errorf("max drawdown = %v, want -25", got)
 	}
-	if !near(r1.DayPnLPct, 1) || !near(r1.SPYDayPct, 1) || !near(r1.CumPnLPct, 1) || !near(r1.SPYCumPct, 1) {
-		t.Errorf("day1 = %+v", r1)
+	if got := maxDrawdown([]float64{100, 101, 102}); got != 0 {
+		t.Errorf("monotonic drawdown = %v, want 0", got)
 	}
-
-	// Day 2 accumulates against the same baselines.
-	r2, err := tr.RecordDay("2026-10-13", 99_990, 101_000, 495, 505, 4)
-	if err != nil {
-		t.Fatal(err)
+	worst, best := minMax(dailyReturns(series))
+	if !near(best, 120.0/105*100-100) || !near(worst, 90.0/120*100-100) {
+		t.Errorf("best/worst = %v/%v", best, worst)
 	}
-	if !near(r2.DayPnLPct, -1) || !near(r2.CumPnLPct, -0.01) || !near(r2.SPYCumPct, -1) || r2.OpenPositions != 4 {
-		t.Errorf("day2 = %+v", r2)
-	}
-
-	if _, err := tr.RecordDay("2026-10-13", 1, 1, 1, 1, 0); err == nil {
-		t.Error("duplicate date must be rejected")
-	}
-	if !tr.Recorded("2026-10-13") || tr.Recorded("2026-10-14") {
-		t.Error("Recorded() wrong")
-	}
-
-	// CSV: header + 2 rows.
-	data, _ := os.ReadFile(dir + "/performance.csv")
-	lines := strings.Split(strings.TrimSpace(strings.ReplaceAll(string(data), "\r\n", "\n")), "\n")
-	if len(lines) != 3 || !strings.HasPrefix(lines[0], "date,equity") || !strings.HasPrefix(lines[2], "2026-10-13,99990.0000") {
-		t.Errorf("csv = %q", lines)
-	}
-
-	// State survives a restart, including baselines and the peak.
-	tr2, err := New(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !tr2.Recorded("2026-10-13") {
-		t.Error("last date lost on reload")
-	}
-	r3, _ := tr2.RecordDay("2026-10-14", 102_010, 99_990, 500, 495, 2)
-	if !near(r3.CumPnLPct, 2.01) || !near(r3.SPYCumPct, 0) {
-		t.Errorf("day3 after reload = %+v", r3)
-	}
-	if got := tr2.ObservePeak(50); !near(got, 102_010) {
-		t.Errorf("peak = %v", got)
+	if pctChange(5, 0) != 0 {
+		t.Error("zero base must not divide")
 	}
 }
 
-func TestObservePeakOnlyRises(t *testing.T) {
-	tr, _ := New(t.TempDir())
-	tr.ObservePeak(100)
-	tr.ObservePeak(120)
-	if got := tr.ObservePeak(110); got != 120 {
-		t.Errorf("peak = %v, want 120", got)
+func TestRoundTrips(t *testing.T) {
+	orders := []Order{
+		{Symbol: "A", Side: "sell", Qty: 5, Price: 1}, // no entry tracked: ignored
+		{Symbol: "A", Side: "buy", Qty: 10, Price: 10},
+		{Symbol: "B", Side: "buy", Qty: 10, Price: 10},
+		{Symbol: "A", Side: "sell", Qty: 10, Price: 12}, // win
+		{Symbol: "B", Side: "sell", Qty: 4, Price: 8},
+		{Symbol: "B", Side: "sell", Qty: 6, Price: 9}, // loss overall
+		{Symbol: "C", Side: "buy", Qty: 1, Price: 5},  // still open
+	}
+	if wins, total := roundTrips(orders); wins != 1 || total != 2 {
+		t.Errorf("wins/total = %d/%d, want 1/2", wins, total)
 	}
 }
 
-func TestHandler(t *testing.T) {
-	tr, _ := New(t.TempDir())
+func TestAlignUsesPriorCloseAsBaseline(t *testing.T) {
+	bot := []Point{{"2026-10-09", 100}, {"2026-10-13", 102}, {"2026-10-14", 101}}
+	spy := []Point{{"2026-10-09", 500}, {"2026-10-13", 505}, {"2026-10-14", 510}}
+	b, s, dates := align(bot, spy, "2026-10-13")
+	if len(dates) != 2 || b[0] != 100 || s[0] != 500 || b[2] != 101 || s[2] != 510 {
+		t.Errorf("align = %v %v %v", b, s, dates)
+	}
+}
+
+type fakeSource struct {
+	equity, spy []Point
+	orders      []Order
+	open        int
+	err         error
+	calls       int
+}
+
+func (f *fakeSource) EquityHistory(int) ([]Point, error)      { f.calls++; return f.equity, f.err }
+func (f *fakeSource) BenchmarkCloses(string) ([]Point, error) { return f.spy, f.err }
+func (f *fakeSource) FilledOrders(string) ([]Order, error)    { return f.orders, f.err }
+func (f *fakeSource) OpenPositions() (int, error)             { return f.open, f.err }
+
+func newFake() *fakeSource {
+	return &fakeSource{
+		equity: []Point{{"2026-10-12", 123456.78}, {"2026-10-13", 124000}, {"2026-10-14", 122000}},
+		spy:    []Point{{"2026-10-12", 500}, {"2026-10-13", 505}, {"2026-10-14", 510}},
+		orders: []Order{
+			{Symbol: "ZZTOP", Side: "buy", Qty: 777, Price: 31.37, FilledAt: time.Now()},
+			{Symbol: "ZZTOP", Side: "sell", Qty: 777, Price: 40.11, FilledAt: time.Now()},
+		},
+		open: 3,
+	}
+}
+
+func serve(s *Service, method string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	tr.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/stats", nil))
-	var empty struct {
-		Latest *Record `json:"latest"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &empty); err != nil || empty.Latest != nil {
-		t.Fatalf("empty stats: %v %s", err, rec.Body)
-	}
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(method, "/stats", nil))
+	return rec
+}
 
-	tr.RecordDay("2026-10-12", 101_000, 100_000, 505, 500, 3)
-	rec = httptest.NewRecorder()
-	tr.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/stats", nil))
-	var got struct {
-		Latest     *Record `json:"latest"`
-		PeakEquity float64 `json:"peak_equity"`
+func TestResponseHasOnlyAllowedFieldsAndNoPrivateValues(t *testing.T) {
+	s := New(newFake(), "2026-10-13")
+	rec := serve(s, http.MethodGet)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || got.Latest == nil || got.Latest.Equity != 101_000 || got.PeakEquity != 101_000 {
-		t.Fatalf("stats = %s", rec.Body)
+	allowed := map[string]bool{
+		"start_date": true, "days_tracked": true, "bot_return_pct": true, "spy_return_pct": true,
+		"excess_return_pct": true, "max_drawdown_pct": true, "best_day_pct": true, "worst_day_pct": true,
+		"num_trades": true, "win_rate_pct": true, "open_positions_count": true, "last_updated": true,
 	}
-	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("content-type %q", ct)
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	for k := range m {
+		if !allowed[k] {
+			t.Errorf("unexpected field %q", k)
+		}
+	}
+	for k := range allowed {
+		if _, ok := m[k]; !ok {
+			t.Errorf("missing field %q", k)
+		}
+	}
+	for _, forbidden := range []string{"equity\"", "cash", "buying_power", "account", "symbol", "qty", "price", "ZZTOP", "123456", "124000", "777", "31.37"} {
+		if strings.Contains(rec.Body.String(), forbidden) {
+			t.Errorf("response contains forbidden %q: %s", forbidden, rec.Body)
+		}
+	}
+	// 100%-baseline checks: bot 123456.78 -> 122000 = -1.18%, SPY 500 -> 510 = +2%.
+	if !near(m["bot_return_pct"].(float64), -1.18) || !near(m["spy_return_pct"].(float64), 2) || m["num_trades"].(float64) != 2 || m["win_rate_pct"].(float64) != 100 {
+		t.Errorf("values = %v", m)
+	}
+}
+
+func TestInsufficientDataReturnsNulls(t *testing.T) {
+	f := newFake()
+	f.equity, f.spy = f.equity[:2], f.spy[:2] // only one tracked day
+	rec := serve(New(f, "2026-10-13"), http.MethodGet)
+	var m map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &m)
+	if m["note"] != "insufficient data" || m["bot_return_pct"] != nil || m["num_trades"] != nil || m["open_positions_count"] != nil {
+		t.Errorf("got %v", m)
+	}
+	if _, ok := m["win_rate_pct"]; !ok {
+		t.Error("shape must be stable")
+	}
+}
+
+func TestMethodAndErrorHandling(t *testing.T) {
+	s := New(newFake(), "2026-10-13")
+	if rec := serve(s, http.MethodPost); rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET" {
+		t.Errorf("POST = %d", rec.Code)
+	}
+	f := &fakeSource{err: errors.New("alpaca error 403: secret-upstream-body")}
+	rec := serve(New(f, "2026-10-13"), http.MethodGet)
+	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "secret") || !strings.Contains(rec.Body.String(), "stats unavailable") {
+		t.Errorf("error response = %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestCache(t *testing.T) {
+	f := newFake()
+	s := New(f, "2026-10-13")
+	clock := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	s.Get()
+	s.Get()
+	if f.calls != 1 {
+		t.Errorf("upstream calls within TTL = %d, want 1", f.calls)
+	}
+	clock = clock.Add(cacheTTL + time.Second)
+	s.Get()
+	if f.calls != 2 {
+		t.Errorf("upstream calls after TTL = %d, want 2", f.calls)
+	}
+}
+
+func TestObservePeakOnlyRisesAndSeedsFromHistory(t *testing.T) {
+	s := New(newFake(), "2026-10-13")
+	// History since the start peaks at 124000; the pre-start 123456.78 is ignored.
+	if got := s.ObservePeak(100); got != 124000 {
+		t.Errorf("seeded peak = %v", got)
+	}
+	if got := s.ObservePeak(130000); got != 130000 {
+		t.Errorf("raised peak = %v", got)
+	}
+	if got := s.ObservePeak(1); got != 130000 {
+		t.Errorf("peak fell to %v", got)
 	}
 }

@@ -1,8 +1,33 @@
 # AutoTradingBot
 
+> Paper trading only. Not financial advice. This is an educational/engineering project; an LLM making trade decisions is experimental and can lose money.
+
 An autonomous paper-trading bot written in Go. Every 15 minutes (configurable) during US market hours it combines technical indicators, recent news and an LLM (Gemini 2.5 Flash) to decide whether to **BUY**, **SELL** or **HOLD** each symbol in a core watchlist plus a few screened candidates, and executes the decision through Alpaca's paper-trading API. It is **long-only**: no shorting, margin, leverage or options.
 
-> **Paper trading only.** This is a personal/educational/portfolio project, not financial advice. It has not been backtested and should not be pointed at a live account.
+## Live track record
+
+[autotradingbot-kjr0.onrender.com/stats](https://autotradingbot-kjr0.onrender.com/stats): percentages only, from the paper account, benchmarked against SPY, tracking since `TRACK_START_DATE` (default `2026-10-13`). Computed on demand from Alpaca and cached for 5 minutes; the free Render instance may take about a minute to wake up. Before two trading days of data exist, every metric is `null` and `note` is `"insufficient data"`.
+
+Example shape (**placeholder numbers, not real results**):
+
+```json
+{
+  "start_date": "2026-10-13",
+  "days_tracked": 20,
+  "bot_return_pct": 1.84,
+  "spy_return_pct": 2.31,
+  "excess_return_pct": -0.47,
+  "max_drawdown_pct": -2.65,
+  "best_day_pct": 1.12,
+  "worst_day_pct": -1.38,
+  "num_trades": 14,
+  "win_rate_pct": 57.14,
+  "open_positions_count": 3,
+  "last_updated": "2026-11-10T21:05:00Z"
+}
+```
+
+Returns are measured from the close before the start date. `max_drawdown_pct` is the worst peak-to-trough decline of the daily equity curve (negative). `win_rate_pct` counts round trips opened and closed since the start (average-cost P&L) and is `null` until one closes. No dollar amounts, symbols, quantities or account identifiers are ever returned.
 
 ## How it works
 
@@ -26,7 +51,28 @@ The model is told the bot is long-only, must ground its answer in the supplied i
 
 Each decision logs one line, `[SYM] ACTION conviction=N | thesis`; set `LOG_LEVEL=debug` to also log Gemini's full reasoning.
 
-<!-- Paste a short excerpt of real logs from Render here, inside a code block -->
+Sample output (illustrative; real logs will replace it):
+
+```
+[Market] Open — running decision cycle
+[AAPL] HOLD conviction=5 | <one-line thesis>
+[NVDA] BUY conviction=8 | <one-line thesis>
+```
+
+## Architecture
+
+```
+scheduler → universe filters → indicators → Gemini decision (JSON) → risk checks → Alpaca bracket orders
+```
+
+1. **Scheduler** (`internal/scheduler`): ticks every `CYCLE_INTERVAL_MIN`, checks Alpaca's clock and calendar, and skips closed sessions.
+2. **Universe filters** (`internal/universe`): core watchlist plus screened candidates, each passing the hard filters (exchange, price, volume, no leveraged ETFs or warrants).
+3. **Indicators**: Alpaca IEX daily bars feed a Python script (RSI, Ichimoku, MACD, Stochastic, Keltner, ATR); `yfinance` supplies fundamentals (beta, P/E, sector, average volume).
+4. **Gemini decision**: the prompt carries indicators, news and the current position; the model replies with JSON (`action`, `conviction`, `thesis`, `reasoning`, `suggested_tickers`).
+5. **Risk checks** (`internal/risk`): sizing by conviction, position and sector caps, reward:risk >= 2, circuit breakers. Enforced in code, not by the prompt.
+6. **Execution**: market entry with server-side stop-loss and take-profit legs (Alpaca bracket orders).
+
+Free-tier constraints: Gemini's free quota is small, so calls are rate limited, budgeted and gated by a per-symbol cooldown. Render's free web service sleeps after inactivity, so an UptimeRobot monitor pings `/health` to keep it awake (a sleeping bot runs no cycles). Render's disk is ephemeral, which is why nothing is persisted and `/stats` is derived from Alpaca.
 
 ## Stack
 
@@ -40,14 +86,14 @@ Each decision logs one line, `[SYM] ACTION conviction=N | thesis`; set `LOG_LEVE
 
 ```
 cmd/bot/                 entrypoint, health endpoint, graceful shutdown
-internal/scheduler/      market cycle, evaluation gate (cooldown/prefilter), order flow, daily stats trigger
+internal/scheduler/      market cycle, evaluation gate (cooldown/prefilter), order flow
 internal/broker/         Alpaca REST client (orders, positions, assets, calendar)
 internal/news/           Alpaca News client
-internal/marketdata/     Alpaca screener and SPY daily-bar snapshot
+internal/marketdata/     Alpaca screener and SPY daily bars
 internal/gemini/         prompt builder and Gemini client (retry + fallback model)
 internal/universe/       dynamic universe and hard symbol filters
 internal/risk/           sizing, bracket levels, circuit breakers, sector limit
-internal/stats/          daily performance CSV, peak equity, GET /stats
+internal/stats/          GET /stats (computed from Alpaca, cached) and the in-memory equity peak
 internal/portfolio/      account and position lookup
 internal/market/         market session (clock + calendar) and entry window
 internal/indicators/     Go wrapper around the Python script
@@ -78,6 +124,7 @@ go run ./cmd/bot
 | `GEMINI_DAILY_BUDGET` | Max Gemini requests per day (America/Los_Angeles day), retries included; decisions pause when spent (default `200`) |
 | `EVAL_COOLDOWN_MIN` | A symbol is sent to Gemini at most once per this many minutes, unless price moved >2%, RSI crossed 30/70, or new news mentions it; `0` disables (default `45`) |
 | `CYCLE_INTERVAL_MIN` | Minutes between market cycles (default `15`) |
+| `TRACK_START_DATE` | First day (`YYYY-MM-DD`) counted by `/stats` (default `2026-10-13`) |
 | `LOG_LEVEL` | `debug` also logs Gemini's full reasoning; anything else logs one line per decision (default `info`) |
 | `PORT` | Port for the `/health` and `/stats` endpoints (default `8080`) |
 
@@ -99,7 +146,7 @@ The filters apply **only to opening new positions**. The bot manages every posit
 
 - Every request, retries included, passes a global rate limiter (`GEMINI_MAX_RPM`) and a daily budget (`GEMINI_DAILY_BUDGET`); the running count is logged once per cycle.
 - HTTP 429 with "quota" in the body (and no per-minute marker) is a daily limit: it is **not retried**. The bot logs `[Gemini] daily quota exhausted, pausing until reset` once and makes no Gemini calls until 00:00 America/Los_Angeles. Other 429s (per-minute) are retried, honoring `Retry-After`; 500, 503 and empty responses keep their retries.
-- While paused, cycles still run reporting, and stops/take-profits keep working because they are server-side bracket orders, but no decisions are made.
+- While paused, no decisions are made, but stops/take-profits keep working because they are server-side bracket orders.
 - Held positions are evaluated before candidates, so they win when the budget is tight. Non-held symbols with RSI between 40 and 60 and no new news are skipped without calling Gemini.
 
 ## Risk controls
@@ -111,23 +158,13 @@ All limits are enforced in code and apply to BUYs; SELL and the server-side stop
 - **Sector cap:** at most 30% of equity in one sector (yfinance sector data); the order is trimmed to fit. If sector data is missing (e.g. ETFs) the rule is skipped and logged.
 - **Bracket orders:** stop-loss at 2x ATR(14) below entry; take-profit at 2x the risk distance unless Gemini proposes one, which must also be >= 2x. A trade with reward:risk below 2 is rejected. Brackets are GTC so the exit legs survive overnight.
 - **Daily loss breaker:** if equity is down 3% or more from the previous close, no new positions until the next session.
-- **Drawdown halt:** if equity is 10% or more below its peak, BUYs halt and a loud `[RISK]` line is logged every cycle until drawdown recovers. The peak is stored in `data/state.json`.
+- **Drawdown halt:** if equity is 10% or more below its peak, BUYs halt and a loud `[RISK]` line is logged every cycle until drawdown recovers. The peak is held in memory, seeded from Alpaca's equity history since `TRACK_START_DATE` (so it survives restarts but ignores earlier highs).
 - **Entry buffer:** no new BUY in the first or last 10 minutes of the session (half days respected via Alpaca's calendar).
 - **Long-only:** SELL is only honored when a long position exists, and it closes the whole position after cancelling its open bracket legs.
 
-## Performance tracking
-
-At the first check after each close the bot appends a line to `data/performance.csv` and logs it:
-
-```
-[Stats] 2026-10-12 equity=$101234.50 day=+0.42% (SPY +0.30%) cum=+1.20% (SPY +0.80%) positions=3
-```
-
-`GET /stats` returns the latest record plus start and peak equity as JSON. Cumulative figures are measured from the first recorded day. `data/` is git-ignored; on hosts with an ephemeral disk (Render free tier) it resets on redeploy or restart, which also resets the peak used by the drawdown halt and the SPY comparison baseline. `/stats` has no authentication.
-
 ## Deployment
 
-The included `Dockerfile` builds the Go binary on top of a Python image. `render.yaml` deploys it as a Render web service; the bot exposes `/health` so an uptime monitor can keep the free instance awake. Secrets are set in the Render dashboard, never in the repository.
+The included `Dockerfile` builds the Go binary on top of a Python image. `render.yaml` deploys it as a Render web service; the bot exposes `/health` so an uptime monitor (UptimeRobot) can keep the free instance awake. Nothing is written to disk. Secrets are set in the Render dashboard, never in the repository.
 
 ## Known limitations
 
@@ -135,7 +172,7 @@ The included `Dockerfile` builds the Go binary on top of a Python image. `render
 - **Yahoo rate limits on cloud IPs:** Yahoo often throttles shared hosting IPs (Render included). Technicals therefore come from Alpaca's free IEX bars, cached 10 minutes; only fundamentals (beta, P/E, sector, average volume) use Yahoo, cached 24 hours. If Yahoo fails, indicators still work but average volume is unknown, so new symbols fail the liquidity filter until fundamentals load (held positions are still evaluated and sold). Data failures for a held position log a WARNING and leave its bracket orders untouched.
 - IEX volume covers only a fraction of market volume, which is why liquidity uses Yahoo's average volume rather than the bars.
 - Indicators use daily bars but the loop runs every 15 minutes, so consecutive cycles often see near-identical data.
-- No backtesting and no persistence of decisions beyond logs.
+- No backtesting and no persistence of decisions beyond logs. `/stats` is only as complete as Alpaca's history: positions opened before `TRACK_START_DATE` are excluded from the win rate, and an intraday request mixes the current partial day for both the bot and SPY.
 - Ichimoku Span A/B read as 0 because three months of daily bars is too short for the 52-period spans shifted by 26.
 
 ## Roadmap

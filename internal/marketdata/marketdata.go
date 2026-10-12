@@ -1,5 +1,5 @@
 // Package marketdata wraps the Alpaca market-data endpoints the bot needs
-// beyond news: the stock screener and daily-bar snapshots.
+// beyond news: the stock screener and daily bars.
 package marketdata
 
 import (
@@ -82,25 +82,30 @@ func (c *Client) Movers(top int) (gainers, losers []string, err error) {
 	return gainers, losers, nil
 }
 
-// DailyCloses returns the latest daily bar's close and date (YYYY-MM-DD, the
-// session it belongs to) and the previous session's close for symbol. Callers
-// must check barDate: before the day's bar exists, the "latest" bar is the
-// previous session's.
-func (c *Client) DailyCloses(symbol string) (last, prev float64, barDate string, err error) {
+// DailyBar is one daily bar: Date is the session (YYYY-MM-DD), Close its close.
+type DailyBar struct {
+	Date  string
+	Close float64
+}
+
+// DailyBars returns split/dividend-adjusted daily bars (IEX feed) for symbol
+// from start (YYYY-MM-DD) onward, oldest first.
+func (c *Client) DailyBars(symbol, start string) ([]DailyBar, error) {
 	var r struct {
-		DailyBar struct {
+		Bars []struct {
 			C float64 `json:"c"`
 			T string  `json:"t"`
-		} `json:"dailyBar"`
-		PrevDailyBar struct {
-			C float64 `json:"c"`
-		} `json:"prevDailyBar"`
+		} `json:"bars"`
 	}
-	if err := c.get("/v2/stocks/"+symbol+"/snapshot?feed=iex", &r); err != nil {
-		return 0, 0, "", err
+	path := "/v2/stocks/" + symbol + "/bars?timeframe=1Day&adjustment=all&feed=iex&limit=1000&start=" + start
+	if err := c.get(path, &r); err != nil {
+		return nil, err
 	}
-	if r.DailyBar.C <= 0 || r.PrevDailyBar.C <= 0 || len(r.DailyBar.T) < 10 {
-		return 0, 0, "", fmt.Errorf("snapshot for %s missing daily bars", symbol)
+	out := make([]DailyBar, 0, len(r.Bars))
+	for _, b := range r.Bars {
+		if b.C > 0 && len(b.T) >= 10 {
+			out = append(out, DailyBar{Date: b.T[:10], Close: b.C})
+		}
 	}
-	return r.DailyBar.C, r.PrevDailyBar.C, r.DailyBar.T[:10], nil
+	return out, nil
 }

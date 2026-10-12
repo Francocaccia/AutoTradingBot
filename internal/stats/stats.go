@@ -1,185 +1,318 @@
-// Package stats persists the bot's daily performance against the SPY
-// benchmark and the equity high-water mark used by the drawdown breaker.
+// Package stats computes the bot's public track record on demand from Alpaca
+// (account equity history, filled orders, SPY bars). Nothing is persisted:
+// the response carries percentages and counts only, never dollar amounts,
+// symbols, quantities or account identifiers.
 package stats
 
 import (
-	"encoding/csv"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strconv"
+	"sort"
 	"sync"
 	"time"
+	_ "time/tzdata" // session dates are in America/New_York; slim images may lack zoneinfo
 )
 
-// Record is one end-of-day performance line.
-type Record struct {
-	Date          string  `json:"date"`
-	Equity        float64 `json:"equity"`
-	DayPnLPct     float64 `json:"day_pnl_pct"`
-	SPYDayPct     float64 `json:"spy_day_pct"`
-	CumPnLPct     float64 `json:"cum_pnl_pct"`
-	SPYCumPct     float64 `json:"spy_cum_pct"`
-	OpenPositions int     `json:"open_positions"`
-}
+const (
+	// DefaultStartDate is used when TRACK_START_DATE is unset or invalid.
+	DefaultStartDate = "2026-10-13"
 
-type state struct {
-	StartDate   string  `json:"start_date"`
-	StartEquity float64 `json:"start_equity"`
-	StartSPY    float64 `json:"start_spy"`
-	PeakEquity  float64 `json:"peak_equity"`
-	LastDate    string  `json:"last_recorded_date"`
-	Latest      *Record `json:"latest"`
-}
+	cacheTTL       = 5 * time.Minute
+	errorTTL       = 30 * time.Second
+	minTrackedDays = 2
+	insufficient   = "insufficient data"
+)
 
-// Tracker is safe for concurrent use (the /stats handler runs on its own goroutine).
-type Tracker struct {
-	dir string
-	mu  sync.Mutex
-	st  state
-}
+var (
+	newYork          = mustLoad("America/New_York")
+	errRecentFailure = errors.New("recent upstream failure")
+)
 
-// New loads (or initialises) the tracker state under dir, e.g. ./data.
-func New(dir string) (*Tracker, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	t := &Tracker{dir: dir}
-	data, err := os.ReadFile(t.statePath())
-	switch {
-	case err == nil:
-		if err := json.Unmarshal(data, &t.st); err != nil {
-			return nil, fmt.Errorf("corrupt %s: %w", t.statePath(), err)
-		}
-	case !os.IsNotExist(err):
-		return nil, err
-	}
-	return t, nil
-}
-
-func (t *Tracker) statePath() string { return filepath.Join(t.dir, "state.json") }
-func (t *Tracker) csvPath() string   { return filepath.Join(t.dir, "performance.csv") }
-
-// ObservePeak raises the stored high-water mark if equity exceeds it and
-// returns the current peak.
-func (t *Tracker) ObservePeak(equity float64) float64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if equity > t.st.PeakEquity {
-		t.st.PeakEquity = equity
-		if err := t.saveLocked(); err != nil {
-			log.Printf("[Stats] could not persist peak equity: %v", err)
-		}
-	}
-	return t.st.PeakEquity
-}
-
-// Recorded reports whether the given date (YYYY-MM-DD) already has a record.
-func (t *Tracker) Recorded(date string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.st.LastDate == date
-}
-
-// RecordDay computes, appends and persists the end-of-day line.
-// dayStartEquity is the previous close's equity; spyClose/spyPrevClose are
-// SPY's close today and on the prior session. The first call fixes the
-// baselines for the cumulative figures.
-func (t *Tracker) RecordDay(date string, equity, dayStartEquity, spyClose, spyPrevClose float64, openPositions int) (Record, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.st.LastDate == date {
-		return Record{}, fmt.Errorf("date %s already recorded", date)
-	}
-	if dayStartEquity <= 0 {
-		dayStartEquity = equity
-	}
-	if t.st.StartEquity <= 0 {
-		t.st.StartDate, t.st.StartEquity, t.st.StartSPY = date, dayStartEquity, spyPrevClose
-	}
-
-	r := Record{
-		Date:          date,
-		Equity:        equity,
-		DayPnLPct:     pct(equity, dayStartEquity),
-		SPYDayPct:     pct(spyClose, spyPrevClose),
-		CumPnLPct:     pct(equity, t.st.StartEquity),
-		SPYCumPct:     pct(spyClose, t.st.StartSPY),
-		OpenPositions: openPositions,
-	}
-	if equity > t.st.PeakEquity {
-		t.st.PeakEquity = equity
-	}
-	if err := t.appendCSVLocked(r); err != nil {
-		return Record{}, err
-	}
-	t.st.LastDate, t.st.Latest = date, &r
-	if err := t.saveLocked(); err != nil {
-		return r, err
-	}
-	return r, nil
-}
-
-func pct(now, base float64) float64 {
-	if base <= 0 {
-		return 0
-	}
-	return (now - base) / base * 100
-}
-
-func (t *Tracker) appendCSVLocked(r Record) error {
-	_, statErr := os.Stat(t.csvPath())
-	f, err := os.OpenFile(t.csvPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+func mustLoad(name string) *time.Location {
+	loc, err := time.LoadLocation(name)
 	if err != nil {
-		return err
+		panic(err)
 	}
-	defer f.Close()
-	w := csv.NewWriter(f)
-	if os.IsNotExist(statErr) {
-		w.Write([]string{"date", "equity", "day_pnl_pct", "spy_day_pct", "cum_pnl_pct", "spy_cum_pct", "open_positions"})
-	}
-	f2 := func(v float64) string { return strconv.FormatFloat(v, 'f', 4, 64) }
-	w.Write([]string{r.Date, f2(r.Equity), f2(r.DayPnLPct), f2(r.SPYDayPct), f2(r.CumPnLPct), f2(r.SPYCumPct), strconv.Itoa(r.OpenPositions)})
-	w.Flush()
-	return w.Error()
+	return loc
 }
 
-// saveLocked writes state atomically (temp file + rename).
-func (t *Tracker) saveLocked() error {
-	data, err := json.MarshalIndent(t.st, "", "  ")
+// Point is one dated value (equity or close).
+type Point struct {
+	Date  string // YYYY-MM-DD
+	Value float64
+}
+
+// Order is a filled order; it is used for counting and win/loss only and is
+// never serialised.
+type Order struct {
+	Symbol   string
+	Side     string // "buy" or "sell"
+	Qty      float64
+	Price    float64
+	FilledAt time.Time
+}
+
+// Source supplies the raw data. AlpacaSource is the production implementation.
+type Source interface {
+	EquityHistory(days int) ([]Point, error)
+	BenchmarkCloses(start string) ([]Point, error)
+	FilledOrders(start string) ([]Order, error)
+	OpenPositions() (int, error)
+}
+
+// Stats is the public /stats payload. Pointer fields serialise as null when
+// there is not enough data yet.
+type Stats struct {
+	StartDate     string   `json:"start_date"`
+	DaysTracked   int      `json:"days_tracked"`
+	BotReturnPct  *float64 `json:"bot_return_pct"`
+	SPYReturnPct  *float64 `json:"spy_return_pct"`
+	ExcessPct     *float64 `json:"excess_return_pct"`
+	MaxDrawdown   *float64 `json:"max_drawdown_pct"`
+	BestDayPct    *float64 `json:"best_day_pct"`
+	WorstDayPct   *float64 `json:"worst_day_pct"`
+	NumTrades     *int     `json:"num_trades"`
+	WinRatePct    *float64 `json:"win_rate_pct"`
+	OpenPositions *int     `json:"open_positions_count"`
+	LastUpdated   string   `json:"last_updated"`
+	Note          string   `json:"note,omitempty"`
+}
+
+// Service computes and caches Stats, and tracks the in-memory equity peak
+// used by the drawdown halt.
+type Service struct {
+	src   Source
+	start string
+	now   func() time.Time
+
+	mu       sync.Mutex
+	cached   *Stats
+	cachedAt time.Time
+	failedAt time.Time
+
+	peakMu     sync.Mutex
+	peak       float64
+	peakSeeded bool
+}
+
+// New returns a Service tracking from start (YYYY-MM-DD); an invalid start
+// falls back to DefaultStartDate.
+func New(src Source, start string) *Service {
+	if _, err := time.Parse("2006-01-02", start); err != nil {
+		log.Printf("[Stats] invalid TRACK_START_DATE %q, using %s", start, DefaultStartDate)
+		start = DefaultStartDate
+	}
+	return &Service{src: src, start: start, now: time.Now}
+}
+
+// Get returns the stats, recomputing at most once per cacheTTL. After a
+// failure it fails fast for errorTTL so an outage cannot be amplified by
+// public traffic.
+func (s *Service) Get() (Stats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	if s.cached != nil && now.Sub(s.cachedAt) < cacheTTL {
+		return *s.cached, nil
+	}
+	if !s.failedAt.IsZero() && now.Sub(s.failedAt) < errorTTL {
+		return Stats{}, errRecentFailure
+	}
+	st, err := s.compute(now)
 	if err != nil {
-		return err
+		s.failedAt = now
+		return Stats{}, err
 	}
-	tmp := t.statePath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, t.statePath())
+	s.cached, s.cachedAt, s.failedAt = &st, now, time.Time{}
+	return st, nil
 }
 
-// FormatLine renders the one-line daily log message.
-func (r Record) FormatLine() string {
-	return fmt.Sprintf("[Stats] %s equity=$%.2f day=%+.2f%% (SPY %+.2f%%) cum=%+.2f%% (SPY %+.2f%%) positions=%d",
-		r.Date, r.Equity, r.DayPnLPct, r.SPYDayPct, r.CumPnLPct, r.SPYCumPct, r.OpenPositions)
+// ObservePeak raises the in-memory equity high-water mark and returns it. On
+// first use it is seeded from the equity history since the tracking start, so
+// a restart does not forget the peak. It is never written to disk.
+func (s *Service) ObservePeak(equity float64) float64 {
+	s.peakMu.Lock()
+	defer s.peakMu.Unlock()
+	if !s.peakSeeded {
+		if hist, err := s.src.EquityHistory(s.historyDays(s.now())); err == nil {
+			s.peakSeeded = true
+			for _, p := range hist {
+				if p.Date >= s.start && p.Value > s.peak {
+					s.peak = p.Value
+				}
+			}
+		} else {
+			log.Printf("[Stats] could not seed equity peak: %v", err)
+		}
+	}
+	if equity > s.peak {
+		s.peak = equity
+	}
+	return s.peak
 }
 
-// Handler serves GET /stats with the latest daily record and baselines.
-func (t *Tracker) Handler() http.Handler {
+// historyDays is how many days of history to request: everything since the
+// start date plus a margin that covers the prior close.
+func (s *Service) historyDays(now time.Time) int {
+	start, _ := time.ParseInLocation("2006-01-02", s.start, newYork)
+	return max(int(now.Sub(start).Hours()/24)+10, 10)
+}
+
+// lookbackStart is where to start fetching SPY bars: early enough to include
+// the session before the start date even across a long weekend or holiday.
+func (s *Service) lookbackStart() string {
+	t, _ := time.Parse("2006-01-02", s.start)
+	return t.AddDate(0, 0, -10).Format("2006-01-02")
+}
+
+func (s *Service) compute(now time.Time) (Stats, error) {
+	out := Stats{StartDate: s.start, LastUpdated: now.UTC().Format(time.RFC3339)}
+
+	equity, err := s.src.EquityHistory(s.historyDays(now))
+	if err != nil {
+		return Stats{}, err
+	}
+	spy, err := s.src.BenchmarkCloses(s.lookbackStart())
+	if err != nil {
+		return Stats{}, err
+	}
+	botVals, spyVals, dates := align(equity, spy, s.start)
+	out.DaysTracked = len(dates)
+	if out.DaysTracked < minTrackedDays {
+		out.Note = insufficient
+		return out, nil
+	}
+
+	last := len(botVals) - 1
+	bot, bench := pctChange(botVals[last], botVals[0]), pctChange(spyVals[last], spyVals[0])
+	worst, best := minMax(dailyReturns(botVals))
+	out.BotReturnPct, out.SPYReturnPct = ptr(round2(bot)), ptr(round2(bench))
+	out.ExcessPct = ptr(round2(bot - bench))
+	out.MaxDrawdown = ptr(round2(maxDrawdown(botVals)))
+	out.BestDayPct, out.WorstDayPct = ptr(round2(best)), ptr(round2(worst))
+
+	orders, err := s.src.FilledOrders(s.start)
+	if err != nil {
+		return Stats{}, err
+	}
+	out.NumTrades = ptr(len(orders))
+	if wins, total := roundTrips(orders); total > 0 {
+		out.WinRatePct = ptr(round2(float64(wins) / float64(total) * 100))
+	}
+	open, err := s.src.OpenPositions()
+	if err != nil {
+		return Stats{}, err
+	}
+	out.OpenPositions = &open
+	return out, nil
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// align returns bot and SPY values on a common set of dates. Index 0 is the
+// baseline: the last session before start (the prior close), or the bot's
+// first data point if the account has no earlier history. The remaining
+// entries are the tracked sessions, so len(dates) is the number of days.
+func align(bot, spy []Point, start string) (botVals, spyVals []float64, dates []string) {
+	sort.SliceStable(bot, func(i, j int) bool { return bot[i].Date < bot[j].Date })
+	sort.SliceStable(spy, func(i, j int) bool { return spy[i].Date < spy[j].Date })
+
+	base := -1
+	for i, p := range bot {
+		if p.Date < start {
+			base = i
+		}
+	}
+	if base < 0 {
+		for i, p := range bot {
+			if p.Date >= start {
+				base = i
+				break
+			}
+		}
+	}
+	if base < 0 {
+		return nil, nil, nil
+	}
+	spyAt := map[string]float64{}
+	baseSPY := 0.0
+	for _, p := range spy {
+		spyAt[p.Date] = p.Value
+		if p.Date <= bot[base].Date {
+			baseSPY = p.Value
+		}
+	}
+	if baseSPY <= 0 {
+		return nil, nil, nil
+	}
+	botVals, spyVals = []float64{bot[base].Value}, []float64{baseSPY}
+	for _, p := range bot[base+1:] {
+		if v, ok := spyAt[p.Date]; ok && p.Date >= start {
+			botVals, spyVals, dates = append(botVals, p.Value), append(spyVals, v), append(dates, p.Date)
+		}
+	}
+	return botVals, spyVals, dates
+}
+
+// roundTrips counts closed long round trips (position goes from open to flat)
+// and how many of them realised a profit, using average cost. Sells with no
+// tracked entry (positions opened before tracking began) are ignored.
+func roundTrips(orders []Order) (wins, total int) {
+	type pos struct{ qty, cost, pnl float64 }
+	book := map[string]*pos{}
+	for _, o := range orders {
+		p := book[o.Symbol]
+		if p == nil {
+			p = &pos{}
+			book[o.Symbol] = p
+		}
+		switch o.Side {
+		case "buy":
+			p.qty += o.Qty
+			p.cost += o.Qty * o.Price
+		case "sell":
+			if p.qty <= 0 {
+				continue
+			}
+			q := min(o.Qty, p.qty)
+			avg := p.cost / p.qty
+			p.pnl += q * (o.Price - avg)
+			p.qty -= q
+			p.cost -= q * avg
+			if p.qty < 1e-9 {
+				total++
+				if p.pnl > 0 {
+					wins++
+				}
+				*p = pos{}
+			}
+		}
+	}
+	return wins, total
+}
+
+// Handler serves GET /stats. Upstream errors are logged, never returned.
+func (s *Service) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.mu.Lock()
-		out := struct {
-			Latest      *Record `json:"latest"`
-			StartDate   string  `json:"start_date,omitempty"`
-			StartEquity float64 `json:"start_equity"`
-			PeakEquity  float64 `json:"peak_equity"`
-			ServedAt    string  `json:"served_at"`
-		}{t.st.Latest, t.st.StartDate, t.st.StartEquity, t.st.PeakEquity, time.Now().UTC().Format(time.RFC3339)}
-		t.mu.Unlock()
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		st, err := s.Get()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(out)
+		if err != nil {
+			if !errors.Is(err, errRecentFailure) {
+				log.Printf("[Stats] compute failed: %v", err)
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"stats unavailable"}` + "\n"))
+			return
+		}
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(st)
 	})
 }

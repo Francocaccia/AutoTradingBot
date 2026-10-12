@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 )
 
@@ -160,6 +161,20 @@ func (c *AlpacaClient) GetAsset(symbol string) ([]byte, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+// GetPortfolioHistory returns the daily equity curve for period (e.g. "30D").
+func (c *AlpacaClient) GetPortfolioHistory(period string) ([]byte, error) {
+	data, _, err := c.doRequest("GET", "/v2/account/portfolio/history?timeframe=1D&period="+period, nil)
+	return data, err
+}
+
+// GetClosedOrders returns up to 500 closed orders submitted after the given
+// RFC3339 timestamp, oldest first.
+func (c *AlpacaClient) GetClosedOrders(after string) ([]byte, error) {
+	q := url.Values{"status": {"closed"}, "direction": {"asc"}, "limit": {"500"}, "after": {after}}
+	data, _, err := c.doRequest("GET", "/v2/orders?"+q.Encode(), nil)
+	return data, err
 }
 
 // GetCalendar returns the trading-calendar entry for a single date

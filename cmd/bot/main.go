@@ -31,7 +31,6 @@ const (
 	defaultMaxCandidates    = 5
 	defaultCycleMin         = 15
 	defaultEvalCooldownMin  = 45
-	dataDir                 = "data"
 )
 
 var coreWatchlist = []string{"SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOG"}
@@ -49,10 +48,7 @@ func main() {
 	geminiClient.SetLimits(envPositive("GEMINI_MAX_RPM", gemini.DefaultMaxRPM), envPositive("GEMINI_DAILY_BUDGET", gemini.DefaultDailyBudget))
 	port := portfolio.NewPortfolio(alpacaClient)
 
-	tracker, err := stats.New(dataDir)
-	if err != nil {
-		log.Fatalf("Cannot initialise ./%s: %v", dataDir, err)
-	}
+	tracker := stats.New(stats.AlpacaSource{Broker: alpacaClient, MarketData: dataClient}, envString("TRACK_START_DATE", stats.DefaultStartDate))
 
 	maxCandidates := envInt("UNIVERSE_MAX_CANDIDATES", defaultMaxCandidates)
 	uni := universe.New(coreWatchlist, maxCandidates, universe.BrokerAssets{Broker: alpacaClient}, dataClient, indicators.Calculate)
@@ -65,7 +61,6 @@ func main() {
 		Portfolio:        port,
 		Universe:         uni,
 		Stats:            tracker,
-		MarketData:       dataClient,
 		MaxPositionPct:   envFloat("MAX_POSITION_PCT", defaultMaxPositionPct),
 		MaxPositionUSD:   envFloat("MAX_POSITION_USD", 0),
 		MaxOpenPositions: envInt("MAX_OPEN_POSITIONS", defaultMaxOpenPositions),
@@ -105,6 +100,13 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)
+}
+
+func envString(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
 }
 
 // envFloat reads a non-negative float env var, keeping def when unset or invalid.

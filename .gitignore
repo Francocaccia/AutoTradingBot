@@ -1,2 +1,8 @@
 .env
 data/
+*.log
+.DS_Store
+/bot
+/bot.exe
+*.exe
+__pycache__/

@@ -13,7 +13,6 @@ import (
 	"github.com/francocaccia/quantengine/internal/gemini"
 	"github.com/francocaccia/quantengine/internal/indicators"
 	"github.com/francocaccia/quantengine/internal/market"
-	"github.com/francocaccia/quantengine/internal/marketdata"
 	"github.com/francocaccia/quantengine/internal/news"
 	"github.com/francocaccia/quantengine/internal/portfolio"
 	"github.com/francocaccia/quantengine/internal/risk"
@@ -22,7 +21,6 @@ import (
 )
 
 const (
-	benchmarkSymbol = "SPY"
 	maxSuggestions  = 3
 )
 
@@ -32,8 +30,7 @@ type Config struct {
 	Gemini     *gemini.Client
 	Portfolio  *portfolio.Portfolio
 	Universe   *universe.Universe
-	Stats      *stats.Tracker
-	MarketData *marketdata.Client
+	Stats      *stats.Service // in-memory equity peak for the drawdown halt
 
 	MaxPositionPct   float64 // % of equity per position (hard cap)
 	MaxPositionUSD   float64 // optional absolute cap; <= 0 disables
@@ -187,15 +184,13 @@ func (s *Scheduler) runMarketCycle() {
 		return
 	}
 	if !sess.IsOpen {
-		s.maybeRecordDay(sess)
 		log.Println("[Market] Closed — skipping cycle")
 		return
 	}
 	log.Println("[Market] Open — running decision cycle")
 
 	// With Gemini paused (daily quota or local budget) no decisions are made.
-	// Stops and take-profits live in server-side bracket orders and end-of-day
-	// reporting runs on the closed-market path, so both keep working.
+	// Stops and take-profits live in server-side bracket orders, so they keep working.
 	if paused, why := s.cfg.Gemini.Paused(); paused {
 		used, budget := s.cfg.Gemini.Usage()
 		log.Printf("[Gemini] paused (%s, %d/%d calls) — no decisions this cycle; bracket orders stay active", why, used, budget)
@@ -489,40 +484,4 @@ func (s *Scheduler) closePosition(symbol string, pos *portfolio.Position, cs *cy
 		cs.sectorValue[sec] -= pos.MarketVal
 	}
 	delete(cs.positions, symbol)
-}
-
-// maybeRecordDay writes the end-of-day performance line once per session,
-// after the close. It is safe to call on every closed-market tick.
-func (s *Scheduler) maybeRecordDay(sess *market.Session) {
-	if s.cfg.Stats == nil || s.cfg.MarketData == nil {
-		return
-	}
-	if !sess.TradingDay || !sess.Now.After(sess.Close) || s.cfg.Stats.Recorded(sess.Date) {
-		return
-	}
-	acct, err := s.cfg.Portfolio.GetAccount()
-	if err != nil {
-		log.Printf("[Stats] account fetch failed: %v — will retry", err)
-		return
-	}
-	positions, err := s.cfg.Portfolio.GetAllPositions()
-	if err != nil {
-		log.Printf("[Stats] positions fetch failed: %v — will retry", err)
-		return
-	}
-	spyClose, spyPrev, barDate, err := s.cfg.MarketData.DailyCloses(benchmarkSymbol)
-	if err != nil {
-		log.Printf("[Stats] %s snapshot failed: %v — will retry", benchmarkSymbol, err)
-		return
-	}
-	if barDate != sess.Date {
-		log.Printf("[Stats] %s daily bar is for %s, not %s yet — will retry", benchmarkSymbol, barDate, sess.Date)
-		return
-	}
-	rec, err := s.cfg.Stats.RecordDay(sess.Date, acct.Equity, acct.LastEquity, spyClose, spyPrev, len(positions))
-	if err != nil {
-		log.Printf("[Stats] could not record %s: %v", sess.Date, err)
-		return
-	}
-	log.Print(rec.FormatLine())
 }
