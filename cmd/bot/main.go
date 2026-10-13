@@ -20,17 +20,24 @@ import (
 	"github.com/francocaccia/quantengine/internal/marketdata"
 	"github.com/francocaccia/quantengine/internal/news"
 	"github.com/francocaccia/quantengine/internal/portfolio"
+	"github.com/francocaccia/quantengine/internal/risk"
 	"github.com/francocaccia/quantengine/internal/scheduler"
 	"github.com/francocaccia/quantengine/internal/stats"
+	"github.com/francocaccia/quantengine/internal/trades"
 	"github.com/francocaccia/quantengine/internal/universe"
 )
 
 const (
 	defaultMaxPositionPct   = 10.0
 	defaultMaxOpenPositions = 8
-	defaultMaxCandidates    = 5
+	defaultMaxCandidates    = 3
 	defaultCycleMin         = 15
-	defaultEvalCooldownMin  = 45
+	defaultMinBuyConviction = 8
+	defaultMinHoldDays      = 3
+	defaultReentryDays      = 3
+	defaultMaxTradesDay     = 2
+	defaultMaxTradesWeek    = 5
+	defaultEvalCooldownMin  = 120
 )
 
 var coreWatchlist = []string{"SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOG"}
@@ -67,6 +74,14 @@ func main() {
 		Debug:            strings.EqualFold(os.Getenv("LOG_LEVEL"), "debug"),
 		CycleInterval:    time.Duration(envPositive("CYCLE_INTERVAL_MIN", defaultCycleMin)) * time.Minute,
 		EvalCooldown:     time.Duration(envInt("EVAL_COOLDOWN_MIN", defaultEvalCooldownMin)) * time.Minute,
+
+		MaxRiskPct:          envFloat("MAX_RISK_PCT", risk.DefaultMaxRiskPct),
+		MinBuyConviction:    envPositive("MIN_BUY_CONVICTION", defaultMinBuyConviction),
+		MinHoldDays:         envInt("MIN_HOLD_DAYS", defaultMinHoldDays),
+		ReentryCooldownDays: envInt("REENTRY_COOLDOWN_DAYS", defaultReentryDays),
+		MaxTradesPerDay:     envPositive("MAX_TRADES_PER_DAY", defaultMaxTradesDay),
+		MaxTradesPerWeek:    envPositive("MAX_TRADES_PER_WEEK", defaultMaxTradesWeek),
+		History:             trades.AlpacaSource{Broker: alpacaClient},
 	})
 
 	// Health endpoint so the host (Render) and an uptime monitor can reach the bot.

@@ -188,6 +188,7 @@ type Decision struct {
 	Conviction       int      `json:"conviction"`
 	Thesis           string   `json:"thesis"`
 	Reasoning        string   `json:"reasoning"`
+	Catalyst         string   `json:"catalyst"` // exact RECENT NEWS headline supporting a BUY, or "none"
 	TakeProfit       float64  `json:"take_profit"`
 	SuggestedTickers []string `json:"suggested_tickers"`
 }
@@ -199,7 +200,23 @@ type PromptInput struct {
 	News       []news.Article
 	// StopLoss is the stop price the bot will attach to a BUY (0 if unknown).
 	StopLoss float64
+	// DaysHeld is the number of trading days since the position was opened;
+	// negative means unknown. Only shown when a position is held.
+	DaysHeld int
+	// Last is the bot's previous decision for this symbol, if remembered.
+	Last *LastDecision
 }
+
+// LastDecision is the bot's previous answer for a symbol (best effort, in memory).
+type LastDecision struct {
+	Action string
+	Thesis string
+	Date   string // YYYY-MM-DD, ET
+}
+
+// MaxPromptHeadlines is how many RECENT NEWS headlines BuildPrompt shows. The
+// catalyst check must use the same list.
+const MaxPromptHeadlines = 10
 
 func BuildPrompt(input PromptInput) string {
 	var sb strings.Builder
@@ -210,8 +227,12 @@ RULES:
 - LONG-ONLY cash account. No shorting, no margin, no leverage, no options, no crypto. BUY opens or adds to a long position. SELL only closes an existing long position (the whole position); if "Current position: none", SELL is invalid, so choose BUY or HOLD.
 - Swing trading: holding periods of days to weeks.
 - Ground every claim in the indicators and news provided below. Do not invent prices, earnings, events or news that are not shown.
-- Rate your conviction from 1 to 10. Choose BUY when conviction >= 7 and you can point to a catalyst in the news or a clear technical setup. Position size is derived from conviction by the bot (7 = smaller, 9-10 = largest), so be honest.
-- Idle cash has an opportunity cost: do not default to HOLD out of caution when a setup is present. But if conviction is below 7, choose HOLD (or SELL if you hold a position and the thesis is broken).
+- Intraday volume is not available. Do not infer low volume from the current session.
+- Doing nothing is a valid and often the best decision. HOLD, or staying in cash, is a position. There is no target number of trades and many sessions should end with no trades. Do not trade to be active.
+- BUY only if BOTH hold: (a) a specific catalyst quoted from the RECENT NEWS section, and (b) a technical setup consistent with a multi-week swing and at least 2:1 reward/risk. An oversold or overbought reading alone is never enough. Do not buy short-term bounces.
+- SELL only if the thesis is broken, the news turned against the position, or the reward/risk no longer justifies holding. Do not sell only because oscillators are overbought.
+- Do not reverse a recent decision unless something material changed. If nothing new, HOLD.
+- Conviction scale: 5 means no edge. 8 or more must be rare. Use 7 or below when unsure. Position size is derived from conviction by the bot, so be honest.
 - The bot sets the stop-loss from ATR and rejects trades with reward:risk below 2:1.
 
 `, input.Symbol))
@@ -219,7 +240,10 @@ RULES:
 	if input.Indicators != nil {
 		ind := input.Indicators
 		sb.WriteString("## TECHNICALS\n")
-		sb.WriteString(fmt.Sprintf("Price: $%.2f | RSI: %.2f | Volume: %d | Avg daily volume: %.0f\n", ind.Price, ind.RSI, ind.Volume, ind.AvgVolume))
+		sb.WriteString(fmt.Sprintf("Price: $%.2f | RSI: %.2f\n", ind.Price, ind.RSI))
+		if ind.RelVolume > 0 {
+			sb.WriteString(fmt.Sprintf("Last completed session volume vs 60-session average: %.2fx\n", ind.RelVolume))
+		}
 		sb.WriteString(fmt.Sprintf("ATR(14): $%.2f | Beta: %.2f | P/E: %.2f\n", ind.ATR, ind.Beta, ind.PE))
 		sb.WriteString(fmt.Sprintf("Ichimoku — Tenkan: %.2f | Kijun: %.2f | SpanA: %.2f | SpanB: %.2f | Chikou: %.2f\n", ind.Ichimoku.Tenkan, ind.Ichimoku.Kijun, ind.Ichimoku.SpanA, ind.Ichimoku.SpanB, ind.Ichimoku.Chikou))
 		sb.WriteString(fmt.Sprintf("MACD: %.4f | Signal: %.4f | Histogram: %.4f\n", ind.MACD.MACD, ind.MACD.Signal, ind.MACD.Histogram))
@@ -231,8 +255,16 @@ RULES:
 	if input.Position == nil {
 		sb.WriteString("Current position: none\n\n")
 	} else {
-		sb.WriteString(fmt.Sprintf("Current position: LONG %d shares | avg entry $%.2f | unrealized P&L %+.2f%%\n\n",
+		sb.WriteString(fmt.Sprintf("Current position: LONG %d shares | avg entry $%.2f | unrealized P&L %+.2f%%\n",
 			input.Position.Qty, input.Position.AvgPrice, input.Position.PLPercent*100))
+		if input.DaysHeld >= 0 {
+			sb.WriteString(fmt.Sprintf("Trading days since opened: %d\n", input.DaysHeld))
+		}
+		sb.WriteString("\n")
+	}
+	if l := input.Last; l != nil && l.Action != "" {
+		sb.WriteString("## YOUR LAST DECISION ON THIS SYMBOL\n")
+		sb.WriteString(fmt.Sprintf("%s on %s: %s\nDo not reverse it unless something material changed.\n\n", l.Action, l.Date, l.Thesis))
 	}
 
 	if input.Indicators != nil && input.StopLoss > 0 && input.StopLoss < input.Indicators.Price {
@@ -248,7 +280,7 @@ RULES:
 		sb.WriteString("(none available)\n")
 	}
 	for i, a := range input.News {
-		if i >= 10 {
+		if i >= MaxPromptHeadlines {
 			break
 		}
 		sb.WriteString(fmt.Sprintf("- [%s] %s\n", a.Source, a.Headline))
@@ -262,6 +294,7 @@ Respond ONLY with valid JSON, no markdown, no backticks:
   "conviction": 1-10 (integer; confidence in the chosen action),
   "thesis": "one sentence",
   "reasoning": "your reasoning, citing the indicators/news above",
+  "catalyst": "the exact headline text from RECENT NEWS that supports a BUY, otherwise the word none",
   "take_profit": 0.0,
   "suggested_tickers": []
 }

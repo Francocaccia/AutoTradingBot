@@ -47,7 +47,7 @@ every CYCLE_INTERVAL_MIN (default 15) min (Mon–Fri, market hours per Alpaca's 
           SELL → cancel bracket legs, close the long
 ```
 
-The model is told the bot is long-only, must ground its answer in the supplied indicators and news, and should BUY when conviction is 7+ with a catalyst or technical setup. Position size, stop-loss and every limit below are enforced in code, not by the prompt.
+The model is told the bot is long-only, must ground its answer in the supplied indicators and news, and is told that doing nothing is a valid, often best, decision; it may BUY only with a quoted news catalyst plus a multi-week technical setup. Position size, stop-loss and every limit below are enforced in code, not by the prompt.
 
 Each decision logs one line, `[SYM] ACTION conviction=N | thesis`; set `LOG_LEVEL=debug` to also log Gemini's full reasoning.
 
@@ -93,6 +93,7 @@ internal/marketdata/     Alpaca screener and SPY daily bars
 internal/gemini/         prompt builder and Gemini client (retry + fallback model)
 internal/universe/       dynamic universe and hard symbol filters
 internal/risk/           sizing, bracket levels, circuit breakers, sector limit
+internal/trades/         position age, re-entry and turnover counts from Alpaca order history
 internal/stats/          GET /stats (computed from Alpaca, cached) and the in-memory equity peak
 internal/portfolio/      account and position lookup
 internal/market/         market session (clock + calendar) and entry window
@@ -119,14 +120,24 @@ go run ./cmd/bot
 | `MAX_POSITION_PCT` | Hard cap per position as % of account equity (default `10`) |
 | `MAX_POSITION_USD` | Optional absolute cap per position in USD; unset or `0` disables it |
 | `MAX_OPEN_POSITIONS` | Max simultaneous open positions (default `8`) |
-| `UNIVERSE_MAX_CANDIDATES` | Extra screened candidates per cycle on top of the core watchlist (default `5`; `0` disables the dynamic universe) |
+| `UNIVERSE_MAX_CANDIDATES` | Extra screened candidates per cycle on top of the core watchlist (default `3`; `0` disables the dynamic universe). A candidate is only sent to Gemini if a cached headline mentions its ticker |
 | `GEMINI_MAX_RPM` | Global cap on Gemini requests per minute, retries included; calls wait for room (default `8`) |
 | `GEMINI_DAILY_BUDGET` | Max Gemini requests per day (America/Los_Angeles day), retries included; decisions pause when spent (default `200`) |
-| `EVAL_COOLDOWN_MIN` | A symbol is sent to Gemini at most once per this many minutes, unless price moved >2%, RSI crossed 30/70, or new news mentions it; `0` disables (default `45`) |
+| `EVAL_COOLDOWN_MIN` | A HELD symbol is sent to Gemini at most once per this many minutes, unless price moved >2%, RSI crossed 30/70, or new news mentions it; `0` disables. Symbols we do not hold are evaluated once per trading day after 10:00 ET and ignore those exceptions (default `120`) |
+| `MAX_RISK_PCT` | Cap on loss-at-stop per BUY, as % of equity: `qty * (entry - stop) <= MAX_RISK_PCT` (default `1.0`) |
+| `MIN_BUY_CONVICTION` | Minimum conviction for a BUY; a BUY also needs a catalyst quoted from the headlines shown to the model (default `8`) |
+| `MIN_HOLD_DAYS` | No SELL of a position opened fewer than this many trading days ago, unless a circuit breaker is active; `0` disables (default `3`) |
+| `REENTRY_COOLDOWN_DAYS` | No BUY of a symbol for this many trading days after any sell of it; `0` disables (default `3`) |
+| `MAX_TRADES_PER_DAY` | Max orders the bot opens from its own decisions per day (default `2`) |
+| `MAX_TRADES_PER_WEEK` | Same, over a rolling 5 trading days (default `5`) |
 | `CYCLE_INTERVAL_MIN` | Minutes between market cycles (default `15`) |
 | `TRACK_START_DATE` | First day (`YYYY-MM-DD`) counted by `/stats` (default `2026-10-13`) |
 | `LOG_LEVEL` | `debug` also logs Gemini's full reasoning; anything else logs one line per decision (default `info`) |
 | `PORT` | Port for the `/health` and `/stats` endpoints (default `8080`) |
+
+## Selective by design
+
+Cash and HOLD are positions. Most days should end with zero or one trade, and a week with two or three well-founded trades beats ten trades a day. Paper trading hides spread and slippage, so churn looks free here but is not. The prompt says so, and code enforces it: a BUY needs conviction >= `MIN_BUY_CONVICTION` and a catalyst that is one of the headlines shown to the model; positions are not sold before `MIN_HOLD_DAYS`; a sold symbol is not re-bought for `REENTRY_COOLDOWN_DAYS`; and `MAX_TRADES_PER_DAY` / `MAX_TRADES_PER_WEEK` cap turnover. Decisions are collected each cycle and executed afterwards, risk-reducing SELLs first, then BUYs by conviction, so a cap binds on the weakest orders. Position age, last sell and trade counts are rebuilt from Alpaca's filled orders (not local state), so restarts do not reset them; a legacy position with no order in the last 45 days has unknown age and no holding restriction. Sizing ladder: conviction 8 = 5% of equity, 9 = 7%, 10 = 10%.
 
 ## Dynamic universe
 
@@ -153,7 +164,8 @@ The filters apply **only to opening new positions**. The bot manages every posit
 
 All limits are enforced in code and apply to BUYs; SELL and the server-side stop-loss legs keep working in every state.
 
-- **Sizing:** target position = % of account equity by conviction (7 -> 5%, 8 -> 7%, 9-10 -> 10%), capped by `MAX_POSITION_PCT`, the optional `MAX_POSITION_USD`, and spendable cash (the lesser of Alpaca's `cash` and `buying_power`, so margin is never used). Value already held in the symbol counts toward the target. Conviction below 7 never buys.
+- **Sizing:** target position = % of account equity by conviction (8 -> 5%, 9 -> 7%, 10 -> 10%), capped by `MAX_POSITION_PCT`, the optional `MAX_POSITION_USD`, and spendable cash (the lesser of Alpaca's `cash` and `buying_power`, so margin is never used). Value already held in the symbol counts toward the target. Conviction below `MIN_BUY_CONVICTION` never buys.
+- **Per-trade risk:** after sizing and the caps below, the quantity is cut so the loss at the stop is at most `MAX_RISK_PCT` of equity (a 23%-away stop shrinks the position); under one share skips the BUY.
 - **Position count:** no new symbol once `MAX_OPEN_POSITIONS` are open.
 - **Sector cap:** at most 30% of equity in one sector (yfinance sector data); the order is trimmed to fit. If sector data is missing (e.g. ETFs) the rule is skipped and logged.
 - **Bracket orders:** stop-loss at 2x ATR(14) below entry; take-profit at 2x the risk distance unless Gemini proposes one, which must also be >= 2x. A trade with reward:risk below 2 is rejected. Brackets are GTC so the exit legs survive overnight.
@@ -170,6 +182,8 @@ The included `Dockerfile` builds the Go binary on top of a Python image. `render
 
 - **Gemini free-tier quota** is small (a few hundred requests per day per model, and low per-minute limits). The cooldown, prefilter, rate limiter and daily budget keep usage below it, but a busy account with many held positions can still exhaust it; decisions then pause until 00:00 Pacific.
 - **Yahoo rate limits on cloud IPs:** Yahoo often throttles shared hosting IPs (Render included). Technicals therefore come from Alpaca's free IEX bars, cached 10 minutes; only fundamentals (beta, P/E, sector, average volume) use Yahoo, cached 24 hours. If Yahoo fails, indicators still work but average volume is unknown, so new symbols fail the liquidity filter until fundamentals load (held positions are still evaluated and sold). Data failures for a held position log a WARNING and leave its bracket orders untouched.
+- **LLM conviction is not calibrated**, so the conviction, catalyst and turnover guards are a blunt control until a decision log exists to tune them against outcomes.
+- Intraday volume is never sent to the model (the IEX feed shows a small slice of consolidated volume). It sees last completed session volume vs the 60-session average, computed from the same bars.
 - IEX volume covers only a fraction of market volume, which is why liquidity uses Yahoo's average volume rather than the bars.
 - Indicators use daily bars but the loop runs every 15 minutes, so consecutive cycles often see near-identical data.
 - No backtesting and no persistence of decisions beyond logs. `/stats` is only as complete as Alpaca's history: positions opened before `TRACK_START_DATE` are excluded from the win rate, and an intraday request mixes the current partial day for both the bot and SPY.

@@ -184,6 +184,14 @@ func (c *AlpacaClient) GetCalendar(date string) ([]byte, error) {
 	return data, err
 }
 
+// GetCalendarRange returns the trading-calendar entries between two dates
+// (YYYY-MM-DD, inclusive); weekends and holidays are absent.
+func (c *AlpacaClient) GetCalendarRange(start, end string) ([]byte, error) {
+	q := url.Values{"start": {start}, "end": {end}}
+	data, _, err := c.doRequest("GET", "/v2/calendar?"+q.Encode(), nil)
+	return data, err
+}
+
 // CancelOpenOrders cancels every open order for symbol (including the legs of
 // a bracket). It must run before closing a position, because shares reserved
 // by open stop/limit legs cannot be sold. Returns how many orders were

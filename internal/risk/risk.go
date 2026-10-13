@@ -9,8 +9,11 @@ import (
 )
 
 const (
-	// MinConviction is the lowest conviction that may open or add to a position.
-	MinConviction = 7
+	// DefaultMinConviction is the lowest conviction that may open or add to a
+	// position unless MIN_BUY_CONVICTION says otherwise.
+	DefaultMinConviction = 8
+	// DefaultMaxRiskPct is the default cap on loss-at-stop per trade, % of equity.
+	DefaultMaxRiskPct = 1.0
 	// MaxSectorPct is the most equity allowed in a single sector.
 	MaxSectorPct = 30.0
 	// StopATRMultiple places the stop-loss this many ATRs below entry.
@@ -26,17 +29,20 @@ const (
 )
 
 // TargetPct maps conviction to a base position size as % of equity:
-// 7 -> 5%, 8 -> 7%, 9-10 -> 10%. Below MinConviction it returns 0.
-func TargetPct(conviction int) float64 {
-	switch {
-	case conviction >= 9:
-		return 10
-	case conviction == 8:
-		return 7
-	case conviction == MinConviction:
-		return 5
-	default:
+// 8 -> 5%, 9 -> 7%, 10 -> 10%. Convictions below minConviction (or below 1)
+// return 0; with a minConviction under 8 the lower ones also get 5%, so the
+// smallest allowed buy is always 5%.
+func TargetPct(conviction, minConviction int) float64 {
+	if conviction < 1 || conviction < minConviction {
 		return 0
+	}
+	switch {
+	case conviction >= 10:
+		return 10
+	case conviction == 9:
+		return 7
+	default:
+		return 5
 	}
 }
 
@@ -46,6 +52,7 @@ type SizeInput struct {
 	Price                float64
 	CurrentPositionValue float64 // existing market value in this symbol
 	Conviction           int
+	MinConviction        int     // <= 0 means DefaultMinConviction
 	MaxPositionPct       float64 // hard cap, % of equity
 	MaxPositionUSD       float64 // optional absolute cap; <= 0 disables
 }
@@ -55,9 +62,13 @@ type SizeInput struct {
 // MaxPositionPct and MaxPositionUSD; what is already held counts toward it,
 // and the order is limited by spendable cash.
 func Size(in SizeInput) (qty int, reason string) {
-	pct := TargetPct(in.Conviction)
+	minConv := in.MinConviction
+	if minConv <= 0 {
+		minConv = DefaultMinConviction
+	}
+	pct := TargetPct(in.Conviction, minConv)
 	if pct == 0 {
-		return 0, fmt.Sprintf("conviction %d below minimum %d", in.Conviction, MinConviction)
+		return 0, fmt.Sprintf("conviction %d below minimum %d", in.Conviction, minConv)
 	}
 	if in.Equity <= 0 || in.Price <= 0 {
 		return 0, fmt.Sprintf("invalid equity (%.2f) or price (%.2f)", in.Equity, in.Price)
@@ -81,6 +92,27 @@ func Size(in SizeInput) (qty int, reason string) {
 		return 0, fmt.Sprintf("insufficient buying power ($%.2f) or size for one share at $%.2f", in.Spendable, in.Price)
 	}
 	return qty, ""
+}
+
+// CapQtyByRisk limits qty so that qty*(price-stop) does not exceed maxRiskPct %
+// of equity (the loss if the stop is hit). It returns the possibly reduced
+// quantity (0 when not even one share fits) and how far the stop is below
+// price, in percent. A non-positive maxRiskPct, equity, or a stop at or above
+// price leaves qty unchanged.
+func CapQtyByRisk(qty int, price, stop, equity, maxRiskPct float64) (capped int, stopPct float64) {
+	if price <= 0 || stop >= price {
+		return qty, 0
+	}
+	perShare := price - stop
+	stopPct = perShare / price * 100
+	if maxRiskPct <= 0 || equity <= 0 {
+		return qty, stopPct
+	}
+	maxQty := int(math.Floor(equity*maxRiskPct/100/perShare + 1e-9))
+	if maxQty < qty {
+		return maxQty, stopPct
+	}
+	return qty, stopPct
 }
 
 // SectorRoom returns the dollars that may still be added to sector without

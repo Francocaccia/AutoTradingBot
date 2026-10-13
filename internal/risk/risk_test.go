@@ -6,27 +6,39 @@ import (
 )
 
 func TestTargetPct(t *testing.T) {
-	cases := map[int]float64{0: 0, 1: 0, 6: 0, 7: 5, 8: 7, 9: 10, 10: 10}
+	cases := map[int]float64{0: 0, 1: 0, 6: 0, 7: 0, 8: 5, 9: 7, 10: 10}
 	for conv, want := range cases {
-		if got := TargetPct(conv); got != want {
-			t.Errorf("TargetPct(%d) = %v, want %v", conv, got, want)
+		if got := TargetPct(conv, 8); got != want {
+			t.Errorf("TargetPct(%d, 8) = %v, want %v", conv, got, want)
 		}
+	}
+	// A lower configured minimum still sizes its first rung at 5%.
+	if got := TargetPct(7, 7); got != 5 {
+		t.Errorf("TargetPct(7, 7) = %v, want 5", got)
+	}
+	// A higher minimum keeps the fixed ladder: 9 is still 7%.
+	if got := TargetPct(9, 9); got != 7 {
+		t.Errorf("TargetPct(9, 9) = %v, want 7", got)
+	}
+	if got := TargetPct(8, 9); got != 0 {
+		t.Errorf("TargetPct(8, 9) = %v, want 0", got)
 	}
 }
 
 func TestSize(t *testing.T) {
-	base := SizeInput{Equity: 100_000, Spendable: 100_000, Price: 100, Conviction: 8, MaxPositionPct: 10}
+	base := SizeInput{Equity: 100_000, Spendable: 100_000, Price: 100, Conviction: 9, MaxPositionPct: 10}
 	tests := []struct {
 		name    string
 		mod     func(*SizeInput)
 		wantQty int
 		wantMsg string
 	}{
-		{"conviction 7 = 5%", func(i *SizeInput) { i.Conviction = 7 }, 50, ""},
-		{"conviction 8 = 7%", func(i *SizeInput) {}, 70, ""},
-		{"conviction 9 = 10%", func(i *SizeInput) { i.Conviction = 9 }, 100, ""},
+		{"conviction 8 = 5%", func(i *SizeInput) { i.Conviction = 8 }, 50, ""},
+		{"conviction 9 = 7%", func(i *SizeInput) {}, 70, ""},
 		{"conviction 10 = 10%", func(i *SizeInput) { i.Conviction = 10 }, 100, ""},
-		{"below minimum conviction", func(i *SizeInput) { i.Conviction = 6 }, 0, "below minimum"},
+		{"conviction 7 is below the default minimum", func(i *SizeInput) { i.Conviction = 7 }, 0, "below minimum 8"},
+		{"configured minimum 7 allows 7 at 5%", func(i *SizeInput) { i.Conviction = 7; i.MinConviction = 7 }, 50, ""},
+		{"configured minimum 9 refuses 8", func(i *SizeInput) { i.Conviction = 8; i.MinConviction = 9 }, 0, "below minimum 9"},
 		{"MAX_POSITION_PCT caps", func(i *SizeInput) { i.Conviction = 10; i.MaxPositionPct = 6 }, 60, ""},
 		{"MAX_POSITION_USD caps", func(i *SizeInput) { i.MaxPositionUSD = 2_000 }, 20, ""},
 		{"abs cap above pct is ignored", func(i *SizeInput) { i.MaxPositionUSD = 50_000 }, 70, ""},

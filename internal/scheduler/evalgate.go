@@ -7,11 +7,24 @@ import (
 )
 
 const (
-	priceMoveTrigger = 0.02 // re-evaluate inside the cooldown after a >2% move
+	priceMoveTrigger = 0.02 // held: re-evaluate inside the cooldown after a >2% move
 	rsiLow, rsiHigh  = 30.0, 70.0
 	quietRSILow      = 40.0 // non-held symbols with RSI in [40, 60] and no news show no setup
 	quietRSIHigh     = 60.0
+
+	// entryReviewHour is the ET hour before which non-held symbols are not
+	// evaluated: the first prints of the session are noisy.
+	entryReviewHour = 10
 )
+
+var eastern = loadET()
+
+func loadET() *time.Location {
+	if loc, err := time.LoadLocation("America/New_York"); err == nil {
+		return loc
+	}
+	return time.FixedZone("ET", -5*3600)
+}
 
 // evalInput is what the gate needs to know about a symbol this cycle.
 type evalInput struct {
@@ -30,10 +43,19 @@ type evalRecord struct {
 	headlines map[string]bool
 }
 
-// evalGate limits how often a symbol is sent to Gemini: once per cooldown,
-// unless the price moved >2% since the last evaluation, RSI crossed 30/70, or
-// a new headline mentions it. Non-held symbols that show no setup are skipped
-// outright. Not safe for concurrent use (the scheduler is single-threaded).
+// evalGate limits how often a symbol is sent to Gemini. Signals come from
+// daily bars, so asking again every cycle mostly samples model noise.
+//
+//   - Held symbols: once per cooldown, unless the price moved >2% since the
+//     last evaluation, RSI crossed 30/70, or a new headline mentions them.
+//     Those exceptions are risk management for an open position.
+//   - Non-held symbols (a possible new entry): at most once per trading day,
+//     in the first eligible cycle at or after 10:00 ET. The exceptions above
+//     never apply: they must not be able to trigger a new entry. Symbols that
+//     show no setup (RSI in [40, 60], no news) are skipped without using the
+//     day's evaluation.
+//
+// Not safe for concurrent use (the scheduler is single-threaded).
 type evalGate struct {
 	cooldown time.Duration
 	last     map[string]evalRecord
@@ -45,16 +67,33 @@ func newEvalGate(cooldown time.Duration) *evalGate {
 
 func crossed(prev, cur, level float64) bool { return (prev-level)*(cur-level) < 0 }
 
-// Check reports whether symbol should be sent to Gemini now. skip is "cooldown"
-// or "no setup" when ok is false; why names the trigger when ok is true.
+func (r evalRecord) hasNews(headlines []string) bool {
+	for _, h := range headlines {
+		if !r.headlines[h] {
+			return true
+		}
+	}
+	return false
+}
+
+// Check reports whether symbol should be sent to Gemini now. skip is
+// "cooldown", "daily", "before 10:00" or "no setup" when ok is false; why
+// names the trigger when ok is true.
 func (g *evalGate) Check(in evalInput) (ok bool, skip, why string) {
 	rec, seen := g.last[in.Symbol]
-	newNews := false
-	for _, h := range in.Headlines {
-		if !rec.headlines[h] {
-			newNews = true
-			break
+	newNews := rec.hasNews(in.Headlines)
+
+	if !in.Held {
+		now := in.Now.In(eastern)
+		switch {
+		case now.Hour() < entryReviewHour:
+			return false, "before 10:00", ""
+		case seen && rec.at.In(eastern).Format("2006-01-02") == now.Format("2006-01-02"):
+			return false, "daily", ""
+		case !newNews && in.RSI >= quietRSILow && in.RSI <= quietRSIHigh:
+			return false, "no setup", ""
 		}
+		return true, "", "daily review"
 	}
 
 	var trigger string
@@ -71,14 +110,6 @@ func (g *evalGate) Check(in evalInput) (ok bool, skip, why string) {
 		trigger = "cooldown elapsed"
 	default:
 		return false, "cooldown", ""
-	}
-
-	// Cheap prefilter for candidates; held positions always get their review.
-	// A price move or RSI cross is itself a setup, so only the routine
-	// triggers (first look, cooldown) are filtered.
-	routine := trigger == "first evaluation" || trigger == "cooldown elapsed"
-	if !in.Held && routine && !newNews && in.RSI >= quietRSILow && in.RSI <= quietRSIHigh {
-		return false, "no setup", ""
 	}
 	return true, "", trigger
 }

@@ -117,6 +117,24 @@ def avg_volume(df, sessions=60):
     return round(safe(hist.mean()), 0)
 
 
+def rel_volume(df, sessions=60):
+    """Last COMPLETED session's volume / mean of the `sessions` completed sessions before it.
+
+    The final bar is the in-progress session and is excluded from both sides, and
+    both sides come from the same bars, so the ratio is unit-consistent even on
+    the IEX feed (whose absolute volume is a small slice of consolidated volume).
+    Returns 0.0 when there is not enough history or the baseline is zero.
+    """
+    vol = df["Volume"]
+    if len(vol) < 3:
+        return 0.0
+    last = safe(vol.iloc[-2])
+    base = safe(vol.iloc[-(sessions + 2):-2].mean())
+    if base <= 0:
+        return 0.0
+    return round(last / base, 2)
+
+
 def rsi(close, length=14):
     delta = close.diff()
     gain  = delta.clip(lower=0).ewm(span=length).mean()
@@ -158,6 +176,7 @@ def technicals(symbol, df, source):
         "rsi":        rsi(df["Close"]),
         "atr":        atr(df),
         "avg_volume": avg_volume(df),
+        "rel_volume": rel_volume(df),
         "ichimoku":   ichimoku(df),
         "macd":       macd(df["Close"]),
         "stochastic": stochastic(df),
