@@ -24,11 +24,12 @@ func (s *Scheduler) reviewReason(cs *cycleState, sess *market.Session) string {
 	if cs.pf == nil || sess.Now.Hour() < entryReviewHour {
 		return ""
 	}
-	if sess.Now.Weekday() == time.Monday && s.lastReviewDay != sess.Date {
-		return "weekly review"
-	}
+	// At most one review per process per day, whatever triggered it.
 	if s.lastReviewDay == sess.Date || s.lastBandReviewDay == sess.Date {
 		return ""
+	}
+	if sess.Now.Weekday() == time.Monday {
+		return "weekly review"
 	}
 	if pts, desc := s.policy.BandBreach(s.bookFrom(cs, cs.account)); pts > reviewBreachPts {
 		return fmt.Sprintf("band breach of %.1f points (%s)", pts, desc)
@@ -46,6 +47,19 @@ func (s *Scheduler) maybeReview(cs *cycleState, sess *market.Session) {
 	if reason == "" {
 		return
 	}
+	// Never spend a call (or mark the day as done) while Gemini is paused: the
+	// review runs on the first cycle after it resumes.
+	pausedFn := s.geminiPaused
+	if pausedFn == nil && s.cfg.Gemini != nil {
+		pausedFn = s.cfg.Gemini.Paused
+	}
+	if pausedFn == nil {
+		return
+	}
+	if paused, why := pausedFn(); paused {
+		log.Printf("[Review] %s skipped: Gemini is paused (%s)", reason, why)
+		return
+	}
 	// Mark the day before calling so a failing call is not retried every cycle.
 	if strings.HasPrefix(reason, "weekly") {
 		s.lastReviewDay = sess.Date
@@ -61,7 +75,7 @@ func (s *Scheduler) maybeReview(cs *cycleState, sess *market.Session) {
 		}
 		options = append(options, gemini.BondOption{Symbol: b.Symbol, Kind: b.Kind, Duration: b.Duration, Credit: b.Credit, CashLike: b.CashLike})
 	}
-	prompt := gemini.BuildReviewPrompt(gemini.ReviewInput{Portfolio: block, Reason: reason, Bonds: options, Held: heldSymbols(cs)})
+	prompt := gemini.BuildReviewPrompt(gemini.ReviewInput{Portfolio: block, Reason: reason, Bonds: options, EquityETFs: s.reviewEquityETFs(), Held: heldSymbols(cs)})
 	r, err := s.cfg.Gemini.Review(prompt)
 	if err != nil {
 		if errors.Is(err, gemini.ErrQuotaExhausted) || errors.Is(err, gemini.ErrBudgetExhausted) {
@@ -91,6 +105,17 @@ func (s *Scheduler) applyReview(reason string, r *gemini.Review, cs *cycleState,
 		}
 	}
 
+	// A book far outside its bands is rebalanced with code-set catalysts, stepwise.
+	var breach portfolio.Breach
+	if cs.account != nil {
+		breach = s.policy.WorstBreach(s.bookFrom(cs, cs.account))
+	}
+	rebalance := breach.Pts > reviewBreachPts
+	if rebalance {
+		log.Printf("[Rebalance] %s: %.1f points outside the band; closing it in steps of at most %.0f%% of equity and %s trades a day",
+			breach.Catalyst(), breach.Pts, bondStepPct, capLabel(s.cfg.MaxTradesPerDay))
+	}
+
 	var queued, rejected []string
 	for i, a := range r.Actions {
 		if i >= maxReviewActions {
@@ -98,6 +123,11 @@ func (s *Scheduler) applyReview(reason string, r *gemini.Review, cs *cycleState,
 			continue
 		}
 		p, why := s.reviewAction(a, cs, block)
+		if why == "" && rebalance && a.Action == "BUY" {
+			// The code states the catalyst; the model's quote is not checked. The
+			// portfolio_rationale is still required by the normal guards.
+			p.decision.Catalyst, p.rebalance = breach.Catalyst(), true
+		}
 		if why != "" {
 			rejected = append(rejected, fmt.Sprintf("%s %s (%s)", a.Action, a.Symbol, why))
 			continue
@@ -116,10 +146,40 @@ func orNone(l []string) string {
 	return strings.Join(l, ", ")
 }
 
+// reviewEquityETFs are the core equity ETFs (SPY, QQQ) the review may buy to
+// raise an equity sleeve that is below its band or target.
+func (s *Scheduler) reviewEquityETFs() []string {
+	if s.cfg.Universe == nil {
+		return nil
+	}
+	var out []string
+	for _, sym := range s.cfg.Universe.Core {
+		if portfolio.IsBroadETF(sym) {
+			out = append(out, sym)
+		}
+	}
+	return out
+}
+
+// reviewMayBuy reports whether the review may propose a BUY of sym: an enabled
+// bond or cash-parking ETF, or one of the core equity ETFs.
+func (s *Scheduler) reviewMayBuy(sym string) bool {
+	if _, ok := portfolio.BondInfoFor(sym); ok {
+		return s.cfg.Bonds.Allowed(sym)
+	}
+	for _, e := range s.reviewEquityETFs() {
+		if e == sym {
+			return true
+		}
+	}
+	return false
+}
+
 // reviewAction validates one recommended action. SELLs must be held; BUYs must
-// be an enabled bond ETF whose market data loads. Everything else about the
-// action (conviction, catalyst, role, correlation, caps, cooldown) is checked
-// by the normal guards at execution.
+// be an enabled bond / cash-parking ETF or a core equity ETF whose market data
+// loads. Whether the purchase fits the IPS (sleeve under target, band maxima,
+// caps) and everything else about the action (conviction, catalyst, role,
+// caps, cooldown) is checked by the normal guards at execution.
 func (s *Scheduler) reviewAction(a gemini.ReviewAction, cs *cycleState, block string) (pendingDecision, string) {
 	d := &gemini.Decision{
 		Action: a.Action, Conviction: a.Conviction, Role: a.Role, Catalyst: a.Catalyst,
@@ -134,8 +194,8 @@ func (s *Scheduler) reviewAction(a gemini.ReviewAction, cs *cycleState, block st
 		}
 		p.position = pos
 	case "BUY":
-		if _, ok := portfolio.BondInfoFor(a.Symbol); !ok || !s.cfg.Bonds.Allowed(a.Symbol) {
-			return p, "not an enabled bond ETF"
+		if !s.reviewMayBuy(a.Symbol) {
+			return p, "not an allowed review asset (enabled bond / cash-parking ETF or core equity ETF)"
 		}
 		if s.fetchBond == nil {
 			return p, "market data unavailable"

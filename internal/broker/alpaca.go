@@ -2,6 +2,8 @@ package broker
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -67,16 +69,31 @@ func (c *AlpacaClient) doRequest(method, path string, body any) ([]byte, int, er
 	return data, resp.StatusCode, nil
 }
 
+// ClientOrderPrefix tags every order the bot submits on its own decision. The
+// trade counters count only filled orders carrying it, so bracket legs (whose
+// client_order_id Alpaca generates) and manual orders never count.
+const ClientOrderPrefix = "atb-"
+
+// NewClientOrderID returns a fresh client_order_id with ClientOrderPrefix.
+func NewClientOrderID() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ClientOrderPrefix + "fallback"
+	}
+	return ClientOrderPrefix + hex.EncodeToString(b[:])
+}
+
 type orderRequest struct {
-	Symbol      string `json:"symbol"`
-	Qty         int    `json:"qty"`
-	Side        Side   `json:"side"`
-	Type        string `json:"type"`
-	TimeInForce string `json:"time_in_force"`
+	Symbol        string `json:"symbol"`
+	Qty           int    `json:"qty"`
+	Side          Side   `json:"side"`
+	Type          string `json:"type"`
+	TimeInForce   string `json:"time_in_force"`
+	ClientOrderID string `json:"client_order_id"`
 }
 
 func (c *AlpacaClient) PlaceMarketOrder(symbol string, qty int, side Side) error {
-	body := orderRequest{Symbol: symbol, Qty: qty, Side: side, Type: "market", TimeInForce: "day"}
+	body := orderRequest{Symbol: symbol, Qty: qty, Side: side, Type: "market", TimeInForce: "day", ClientOrderID: NewClientOrderID()}
 	_, _, err := c.doRequest("POST", "/v2/orders", body)
 	return err
 }
@@ -87,14 +104,15 @@ type bracketLeg struct {
 }
 
 type bracketOrderRequest struct {
-	Symbol      string     `json:"symbol"`
-	Qty         int        `json:"qty"`
-	Side        Side       `json:"side"`
-	Type        string     `json:"type"`
-	TimeInForce string     `json:"time_in_force"`
-	OrderClass  string     `json:"order_class"`
-	TakeProfit  bracketLeg `json:"take_profit"`
-	StopLoss    bracketLeg `json:"stop_loss"`
+	Symbol        string     `json:"symbol"`
+	Qty           int        `json:"qty"`
+	Side          Side       `json:"side"`
+	Type          string     `json:"type"`
+	TimeInForce   string     `json:"time_in_force"`
+	OrderClass    string     `json:"order_class"`
+	ClientOrderID string     `json:"client_order_id"`
+	TakeProfit    bracketLeg `json:"take_profit"`
+	StopLoss      bracketLeg `json:"stop_loss"`
 }
 
 // bracketTimeInForce is GTC so the stop-loss and take-profit legs stay live
@@ -106,27 +124,29 @@ const bracketTimeInForce = "gtc"
 // and stop-loss legs (order_class: bracket).
 func (c *AlpacaClient) PlaceBracketOrder(symbol string, qty int, side Side, stopLoss, takeProfit float64) error {
 	body := bracketOrderRequest{
-		Symbol:      symbol,
-		Qty:         qty,
-		Side:        side,
-		Type:        "market",
-		TimeInForce: bracketTimeInForce,
-		OrderClass:  "bracket",
-		TakeProfit:  bracketLeg{LimitPrice: fmt.Sprintf("%.2f", takeProfit)},
-		StopLoss:    bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
+		Symbol:        symbol,
+		Qty:           qty,
+		Side:          side,
+		Type:          "market",
+		TimeInForce:   bracketTimeInForce,
+		OrderClass:    "bracket",
+		ClientOrderID: NewClientOrderID(),
+		TakeProfit:    bracketLeg{LimitPrice: fmt.Sprintf("%.2f", takeProfit)},
+		StopLoss:      bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
 	}
 	_, _, err := c.doRequest("POST", "/v2/orders", body)
 	return err
 }
 
 type otoOrderRequest struct {
-	Symbol      string     `json:"symbol"`
-	Qty         int        `json:"qty"`
-	Side        Side       `json:"side"`
-	Type        string     `json:"type"`
-	TimeInForce string     `json:"time_in_force"`
-	OrderClass  string     `json:"order_class"`
-	StopLoss    bracketLeg `json:"stop_loss"`
+	Symbol        string     `json:"symbol"`
+	Qty           int        `json:"qty"`
+	Side          Side       `json:"side"`
+	Type          string     `json:"type"`
+	TimeInForce   string     `json:"time_in_force"`
+	OrderClass    string     `json:"order_class"`
+	ClientOrderID string     `json:"client_order_id"`
+	StopLoss      bracketLeg `json:"stop_loss"`
 }
 
 // PlaceOTOOrder submits a market entry with an attached stop-loss leg only
@@ -135,7 +155,7 @@ type otoOrderRequest struct {
 func (c *AlpacaClient) PlaceOTOOrder(symbol string, qty int, side Side, stopLoss float64) error {
 	body := otoOrderRequest{
 		Symbol: symbol, Qty: qty, Side: side, Type: "market", TimeInForce: bracketTimeInForce,
-		OrderClass: "oto", StopLoss: bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
+		OrderClass: "oto", ClientOrderID: NewClientOrderID(), StopLoss: bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
 	}
 	_, _, err := c.doRequest("POST", "/v2/orders", body)
 	return err

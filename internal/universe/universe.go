@@ -89,6 +89,7 @@ type Universe struct {
 	Prefetch func(symbols []string)
 	// Exempt lists symbols (the curated bond ETFs) that skip the price and
 	// average-volume filters. The leveraged/inverse check still applies. May be nil.
+	// Core watchlist symbols skip the average-volume filter too (price still applies).
 	Exempt func(symbol string) bool
 	// Held lists symbols currently held; a candidate whose other share class
 	// is held is skipped. Set by the scheduler each cycle.
@@ -283,15 +284,27 @@ func (u *Universe) validateMarket(symbol string, asset *Asset) (*indicators.Resu
 	if err != nil {
 		return nil, fmt.Errorf("market data fetch failed: %w", err)
 	}
+	// Screener candidates fail CLOSED on every filter, including unknown volume.
+	// The curated bond ETFs and the core watchlist are known, liquid names: an
+	// unavailable volume (Yahoo failing from a cloud IP) must not drop them.
+	exempt := u.Exempt != nil && u.Exempt(symbol)
 	check := CheckMarket
-	if u.Exempt != nil && u.Exempt(symbol) {
+	switch {
+	case exempt:
 		check = CheckMarketExempt
+	case u.isCore(symbol):
+		check = CheckMarketCore
 	}
 	if err := check(asset, ind); err != nil {
 		return nil, err
 	}
+	if ind.AvgVolume <= 0 && (exempt || u.isCore(symbol)) {
+		log.Printf("[Universe] WARN %s: avg daily volume unavailable, keeping it (core watchlist / bond ETF sleeve are exempt from the liquidity filter)", symbol)
+	}
 	return ind, nil
 }
+
+func (u *Universe) isCore(symbol string) bool { return contains(u.Core, symbol) }
 
 // CheckAsset applies the Alpaca-side filters: exists (non-nil), active,
 // tradable, US equity class, NYSE/NASDAQ/ARCA, and no leveraged/inverse name.
@@ -333,6 +346,25 @@ func CheckMarket(a *Asset, ind *indicators.Result) error {
 	}
 	if ind.AvgVolume < MinAvgVolume {
 		return fmt.Errorf("avg daily volume %.0f below %.0f", ind.AvgVolume, MinAvgVolume)
+	}
+	isETF := ind.QuoteType != "" && !strings.EqualFold(ind.QuoteType, "EQUITY")
+	for _, name := range []string{ind.Name, nameOf(a)} {
+		if IsLeveragedOrInverse(name, isETF) {
+			return fmt.Errorf("leveraged/inverse product %q", name)
+		}
+	}
+	return nil
+}
+
+// CheckMarketCore is CheckMarket without the average-volume filter, for the
+// core watchlist: a missing or low volume reading never drops a core symbol.
+// The price and leveraged/inverse filters still apply.
+func CheckMarketCore(a *Asset, ind *indicators.Result) error {
+	if ind == nil {
+		return errors.New("no market data")
+	}
+	if ind.Price < MinPrice {
+		return fmt.Errorf("price $%.2f below $%.0f", ind.Price, MinPrice)
 	}
 	isETF := ind.QuoteType != "" && !strings.EqualFold(ind.QuoteType, "EQUITY")
 	for _, name := range []string{ind.Name, nameOf(a)} {

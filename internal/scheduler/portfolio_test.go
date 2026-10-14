@@ -132,7 +132,7 @@ func TestBondBuyMacroCatalystAndRegime(t *testing.T) {
 		{"long duration allowed with data", "IEF", "VIX: 27.3", true, true, ""},
 		{"long duration blocked without macro data", "TLT", "VIX: 27.3", false, false, "macro-unavailable"},
 		{"IEF blocked without macro data", "IEF", "VIX: 27.3", false, false, "macro-unavailable"},
-		{"SHY still allowed without macro data", "SHY", "cash 41.0%", false, true, ""},
+		{"SHY still allowed without macro data", "SHY", "cash 41.0% (band 5-30%, target 10%)", false, true, ""},
 		{"placeholder text is never a catalyst", "SHY", "Macro regime: unavailable", false, false, "catalyst"},
 	}
 	for _, tc := range tests {
@@ -207,7 +207,7 @@ func TestCashLikeETFIsAPlainMarketOrderAndOnlyWhenCashIsAboveItsBand(t *testing.
 	cs := newCycle()
 	withRegime(cs, true)
 	withAccount(s, cs, 100_000, 100_000) // 100% cash: far above the 30% max
-	cs.pending = []pendingDecision{bondBuy("SGOV", "cash 41.0%")}
+	cs.pending = []pendingDecision{bondBuy("SGOV", "cash 41.0% (band 5-30%, target 10%)")}
 	cs.pending[0].decision.Role = "cash_parking"
 	s.executeDecisions(cs)
 	ord, ok := o.order("SGOV")
@@ -225,7 +225,7 @@ func TestCashLikeETFIsAPlainMarketOrderAndOnlyWhenCashIsAboveItsBand(t *testing.
 	hold(cs, "B", 10_000)
 	hold(cs, "C", 10_000)
 	withAccount(s, cs, 100_000, 25_000) // 25% cash < 30% max
-	cs.pending = []pendingDecision{bondBuy("SGOV", "cash 41.0%")}
+	cs.pending = []pendingDecision{bondBuy("SGOV", "cash 41.0% (band 5-30%, target 10%)")}
 	cs.pending[0].decision.Role = "cash_parking"
 	s.executeDecisions(cs)
 	if len(o.placed) != 0 || cs.dropReasons["cash-in-band"] != 1 {
@@ -514,7 +514,7 @@ func TestReviewBuyGoesThroughEveryGuard(t *testing.T) {
 	withRegime(cs, true)
 	withAccount(s, cs, 100_000, 100_000)
 	r := &gemini.Review{Actions: []gemini.ReviewAction{
-		{Action: "BUY", Symbol: "SGOV", Conviction: 8, Role: "cash_parking", Catalyst: "cash 41.0%", Rationale: "park idle cash"},
+		{Action: "BUY", Symbol: "SGOV", Conviction: 8, Role: "cash_parking", Catalyst: "cash 41.0% (band 5-30%, target 10%)", Rationale: "park idle cash"},
 	}}
 	s.applyReview("weekly review", r, cs, block)
 	if len(cs.pending) != 1 {

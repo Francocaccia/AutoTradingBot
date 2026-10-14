@@ -65,9 +65,10 @@ const (
 
 	MacroTTL        = time.Hour        // yields, VIX, SPY/TLT trend
 	BarsTTL         = 10 * time.Minute // technicals
-	FundamentalsTTL = 24 * time.Hour   // beta, P/E, sector, name, average volume
+	FundamentalsTTL = 12 * time.Hour   // beta, P/E, sector, name, average volume; half of volumeTTL so a failed refresh still has a usable fallback
 	macroFailureTTL = 10 * time.Minute
 	failureTTL      = 2 * time.Minute // negative cache, so one cycle does not hammer a failing source
+	volumeTTL       = 24 * time.Hour  // last good average volume, used when Yahoo fails
 	logSnippet      = 300
 )
 
@@ -109,14 +110,26 @@ type fundamentals struct {
 // Provider fetches indicators with one batched worker call per cycle and
 // caches them in memory: technicals for 10 minutes, fundamentals for 24 hours.
 type Provider struct {
-	run Runner
-	now func() time.Time
+	run   Runner
+	now   func() time.Time
+	sleep func(time.Duration) // backoff between fundamentals retries; overridden in tests
 
-	mu    sync.Mutex
-	bars  map[string]barsEntry
-	funds map[string]fundEntry
-	macro macroEntry
+	mu      sync.Mutex
+	bars    map[string]barsEntry
+	funds   map[string]fundEntry
+	lastVol map[string]volEntry // last good average volume per symbol
+	macro   macroEntry
 }
+
+// volEntry is the last non-zero Yahoo average volume seen for a symbol.
+type volEntry struct {
+	v  float64
+	at time.Time
+}
+
+// fundRetryDelays are the waits before fundamentals retry 1 and 2 (3 attempts
+// in all). Yahoo throttles cloud IPs in bursts, so a short backoff often works.
+var fundRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second}
 
 // MacroQuote is the latest close of a macro series and, for SPY and TLT, its
 // 200-day simple moving average. A nil field means the value is unavailable.
@@ -157,7 +170,7 @@ func NewProvider(run Runner) *Provider {
 	if run == nil {
 		run = execRunner
 	}
-	return &Provider{run: run, now: time.Now, bars: map[string]barsEntry{}, funds: map[string]fundEntry{}}
+	return &Provider{run: run, now: time.Now, sleep: time.Sleep, bars: map[string]barsEntry{}, funds: map[string]fundEntry{}, lastVol: map[string]volEntry{}}
 }
 
 var defaultProvider = NewProvider(nil)
@@ -279,29 +292,56 @@ func (p *Provider) fetchBars(symbols []string) {
 	}
 }
 
+// fetchFund loads fundamentals, retrying the symbols that failed with a short
+// backoff (Yahoo often throttles shared cloud IPs for a few seconds). A good
+// average volume is remembered for volumeTTL as a fallback.
 func (p *Provider) fetchFund(symbols []string) {
-	raw, batchErr := p.call("fundamentals", symbols)
+	results := map[string]fundEntry{}
+	remaining := symbols
+	for attempt := 0; ; attempt++ {
+		raw, batchErr := p.call("fundamentals", remaining)
+		now := p.now()
+		var failed []string
+		var lastErr error
+		for _, s := range remaining {
+			e := fundEntry{at: now}
+			switch {
+			case batchErr != nil:
+				e.err = batchErr
+			case raw[s] == nil:
+				e.err = errors.New("no fundamentals returned")
+			default:
+				var f fundamentals
+				if err := json.Unmarshal(raw[s], &f); err != nil {
+					e.err = err
+				} else if f.Error != "" {
+					e.err = errors.New(f.Error)
+				} else {
+					e.f = &f
+				}
+			}
+			if e.err != nil {
+				failed = append(failed, s)
+				lastErr = e.err
+			}
+			results[s] = e
+		}
+		if len(failed) == 0 || attempt >= len(fundRetryDelays) {
+			break
+		}
+		delay := fundRetryDelays[attempt]
+		log.Printf("[Indicators] fundamentals failed for %d symbol(s) (%v); retry %d/%d in %s", len(failed), lastErr, attempt+1, len(fundRetryDelays), delay)
+		p.sleep(delay)
+		remaining = failed
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := p.now()
-	for _, s := range symbols {
-		e := fundEntry{at: now}
-		switch {
-		case batchErr != nil:
-			e.err = batchErr
-		case raw[s] == nil:
-			e.err = errors.New("no fundamentals returned")
-		default:
-			var f fundamentals
-			if err := json.Unmarshal(raw[s], &f); err != nil {
-				e.err = err
-			} else if f.Error != "" {
-				e.err = errors.New(f.Error)
-			} else {
-				e.f = &f
-			}
-		}
+	for s, e := range results {
 		p.funds[s] = e
+		if e.f != nil && e.f.AvgVolume > 0 {
+			p.lastVol[s] = volEntry{v: e.f.AvgVolume, at: e.at}
+		}
 	}
 }
 
@@ -327,6 +367,12 @@ func (p *Provider) Calculate(symbol string) (*Result, error) {
 		}
 	} else if res.Source != "yfinance" {
 		res.AvgVolume = 0 // unknown: IEX volume would understate liquidity
+	}
+	if res.Source != "yfinance" && res.AvgVolume <= 0 {
+		// Yahoo failed or returned nothing: fall back to the last good value (24h).
+		if v, ok := p.lastVol[symbol]; ok && p.now().Sub(v.at) < volumeTTL {
+			res.AvgVolume = v.v
+		}
 	}
 	return &res, nil
 }

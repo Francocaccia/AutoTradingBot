@@ -183,3 +183,98 @@ func TestAlpacaSourceParsesFilledOrders(t *testing.T) {
 		t.Errorf("trading days = %v, %v", d, err)
 	}
 }
+
+// 3 bracket parents + their 6 legs + 3 market sells = 6 decisions, however the
+// orders are tagged.
+func threeBracketsSixLegsThreeSells(t *testing.T, prefixed bool) []Fill {
+	t.Helper()
+	var out []Fill
+	for i, sym := range []string{"AAA", "BBB", "CCC"} {
+		at := et(t, "2026-10-13 10:00")
+		parent := Fill{Symbol: sym, Side: "buy", Type: "market", OrderClass: "bracket", At: at, Qty: 10}
+		if prefixed {
+			parent.ClientOrderID = broker.ClientOrderPrefix + "parent" + sym
+		}
+		out = append(out, parent,
+			// The two legs: Alpaca generates their client_order_id and links them to the parent.
+			Fill{Symbol: sym, Side: "sell", Type: "stop", OrderClass: "bracket", ParentID: "p" + sym, ClientOrderID: "uuid-s" + sym, At: at.Add(time.Hour), Qty: 10},
+			Fill{Symbol: sym, Side: "sell", Type: "limit", OrderClass: "bracket", ParentID: "p" + sym, ClientOrderID: "uuid-l" + sym, At: at.Add(2 * time.Hour), Qty: 10})
+		sell := Fill{Symbol: sym, Side: "sell", Type: "market", At: et(t, "2026-10-13 14:00").Add(time.Duration(i) * time.Minute), Qty: 10}
+		if prefixed {
+			sell.ClientOrderID = broker.ClientOrderPrefix + "sell" + sym
+		}
+		out = append(out, sell)
+	}
+	return out
+}
+
+func TestDecisionCountFixtureCountsOnlyParents(t *testing.T) {
+	for _, prefixed := range []bool{true, false} {
+		s := snap(t, threeBracketsSixLegsThreeSells(t, prefixed)...)
+		_, week := s.DecisionCounts()
+		if week != 6 {
+			t.Errorf("prefixed=%v: week = %d, want 6 (3 buys + 3 sells)", prefixed, week)
+		}
+		b := s.DecisionBreakdown()
+		if len(b.Counted) != 6 || b.Excluded["bracket/OTO leg"] != 6 {
+			t.Errorf("prefixed=%v: breakdown counted %d, excluded %v", prefixed, len(b.Counted), b.Excluded)
+		}
+	}
+}
+
+func TestIsDecisionRules(t *testing.T) {
+	tests := []struct {
+		name string
+		f    Fill
+		want bool
+	}{
+		{"prefixed parent", Fill{Side: "buy", Type: "market", OrderClass: "bracket", ClientOrderID: "atb-1"}, true},
+		{"prefixed plain sell", Fill{Side: "sell", Type: "market", ClientOrderID: "atb-2"}, true},
+		{"prefixed but a leg", Fill{Side: "sell", Type: "stop", ParentID: "x", ClientOrderID: "atb-3"}, false},
+		{"legacy simple buy", Fill{Side: "buy", Type: "market", OrderClass: "simple"}, true},
+		{"legacy oto buy", Fill{Side: "buy", Type: "market", OrderClass: "oto"}, true},
+		{"legacy plain market sell", Fill{Side: "sell", Type: "market"}, true},
+		{"legacy leg with parent id", Fill{Side: "sell", Type: "market", ParentID: "x"}, false},
+		{"legacy stop fill", Fill{Side: "sell", Type: "stop"}, false},
+		{"legacy limit sell", Fill{Side: "sell", Type: "limit"}, false},
+		{"legacy bracket sell without parent link", Fill{Side: "sell", Type: "market", OrderClass: "bracket"}, false},
+		{"foreign prefix", Fill{Side: "sell", Type: "limit", ClientOrderID: "manual-1"}, false},
+		{"unknown order class", Fill{Side: "buy", Type: "market", OrderClass: "mleg"}, false},
+	}
+	for _, tc := range tests {
+		if got := tc.f.IsDecision(); got != tc.want {
+			t.Errorf("%s: IsDecision = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestCountStartDateExcludesEarlierTrades(t *testing.T) {
+	s := snap(t, threeBracketsSixLegsThreeSells(t, true)...) // all on 2026-10-13
+	s.SetCountStart("2026-10-14")
+	if today, week := s.DecisionCounts(); today != 0 || week != 0 {
+		t.Errorf("trades before GUARDS_START_DATE counted: %d/%d", today, week)
+	}
+	if b := s.DecisionBreakdown(); len(b.Counted) != 0 || b.Excluded["before GUARDS_START_DATE"] != 6 {
+		t.Errorf("breakdown = %+v", b)
+	}
+	s.SetCountStart("2026-10-13")
+	if _, week := s.DecisionCounts(); week != 6 {
+		t.Errorf("start date is inclusive, week = %d", week)
+	}
+}
+
+func TestFillsReadsClientOrderFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[
+		 {"id":"1","client_order_id":"atb-abc","order_class":"bracket","symbol":"A","side":"buy","type":"market","status":"filled","filled_qty":"5","filled_at":"2026-10-13T14:00:00Z","submitted_at":"2026-10-13T14:00:00Z"},
+		 {"id":"2","client_order_id":"uuid","order_class":"bracket","parent_order_id":"1","symbol":"A","side":"sell","type":"stop","status":"filled","filled_qty":"5","filled_at":"2026-10-13T15:00:00Z","submitted_at":"2026-10-13T14:00:00Z"}]`))
+	}))
+	defer srv.Close()
+	fills, err := AlpacaSource{Broker: broker.NewAlpacaClient("k", "s", srv.URL)}.Fills(et(t, "2026-10-01 00:00"))
+	if err != nil || len(fills) != 2 {
+		t.Fatalf("fills = %+v, %v", fills, err)
+	}
+	if !fills[0].IsDecision() || fills[0].ClientOrderID != "atb-abc" || fills[1].ParentID != "1" || fills[1].IsDecision() {
+		t.Errorf("fields not carried through: %+v", fills)
+	}
+}

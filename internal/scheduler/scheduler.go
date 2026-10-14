@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/francocaccia/quantengine/internal/analysis"
@@ -74,6 +75,9 @@ type Config struct {
 	ReentryCooldownDays int     // no BUY this many trading days after a sell; 0 disables
 	MaxTradesPerDay     int     // bot-decision orders per day; <= 0 means unlimited
 	MaxTradesPerWeek    int     // bot-decision orders per rolling 5 trading days; <= 0 means unlimited
+	// GuardsStartDate (YYYY-MM-DD, ET): decisions before it do not count toward
+	// the daily/weekly caps. Empty counts everything in the lookback.
+	GuardsStartDate string
 
 	// History supplies filled orders and the trading calendar for the holding,
 	// cooldown and turnover guards. Without it BUYs are blocked.
@@ -114,6 +118,9 @@ type Scheduler struct {
 	lastReviewDay     string // session date of the last weekly review call
 	lastBandReviewDay string // session date of the last band-breach review call
 
+	// geminiPaused overrides cfg.Gemini.Paused (tests).
+	geminiPaused func() (bool, string)
+
 	// fetchBond loads indicators for a bond ETF proposed by the review.
 	fetchBond func(symbol string) (*indicators.Result, error)
 }
@@ -152,6 +159,7 @@ func (s *Scheduler) IsPaused() bool { return s.paused }
 
 func (s *Scheduler) Start() {
 	log.Printf("Scheduler started (cycle every %s, eval cooldown %s); first decision cycle at the next tick", s.cfg.CycleInterval, s.cfg.EvalCooldown)
+	s.logDecisionBreakdown(time.Now())
 	// No decision cycle at process start: redeploys would burn Gemini quota.
 	s.fetchAndCacheNews()
 	newsTicker := time.NewTicker(4 * time.Hour)
@@ -279,6 +287,9 @@ type pendingDecision struct {
 	portfolioText string   // the PORTFOLIO block shown to the model, for macro-catalyst verification
 	corr          *analysis.Correlation
 	fromReview    bool // came from the weekly review (SELLs are exempt from MIN_HOLD_DAYS)
+	// rebalance marks a review BUY caused by a band breach: the code sets its
+	// catalyst (the model's quote is not checked) and the purchase is stepwise.
+	rebalance bool
 }
 
 // drop records a decision a guard refused to execute.
@@ -326,7 +337,11 @@ func (s *Scheduler) runMarketCycle() {
 	// Stops and take-profits live in server-side bracket orders, so they keep working.
 	if paused, why := s.cfg.Gemini.Paused(); paused {
 		used, budget := s.cfg.Gemini.Usage()
-		log.Printf("[Gemini] paused (%s, %d/%d calls) — no decisions this cycle; bracket orders stay active", why, used, budget)
+		label := "quota"
+		if strings.Contains(why, "budget") {
+			label = "budget"
+		}
+		log.Printf("[Gemini] %s: paused (%s; %d/%d calls counted by this process) — no decisions this cycle; bracket orders stay active", label, why, used, budget)
 		return
 	}
 
@@ -362,6 +377,7 @@ func (s *Scheduler) runMarketCycle() {
 		if snap, err := trades.Load(s.cfg.History, sess.Now); err != nil {
 			log.Printf("[Trades] order history unavailable: %v — BUYs blocked this cycle, SELLs not restricted", err)
 		} else {
+			snap.SetCountStart(s.cfg.GuardsStartDate)
 			cs.history = snap
 			cs.tradesDay, cs.tradesWeek = snap.DecisionCounts()
 		}
@@ -391,17 +407,18 @@ func (s *Scheduler) runMarketCycle() {
 		s.noteSector(items[i].Symbol, items[i].Ind)
 	}
 
-	// Portfolio-level context (weights, risk, regime) once per cycle, then the
-	// weekly review, whose actions join this cycle's decisions.
+	// Portfolio-level context (weights, risk, regime) once per cycle.
 	s.buildPortfolio(cs)
-	s.maybeReview(cs, sess)
 
+	// Gemini priority when the daily budget is limited: held positions, then the
+	// weekly / band-breach review (its actions join this cycle's decisions),
+	// then core symbols, then screener candidates.
 	for _, sym := range held {
 		if cs.stopGemini {
 			break
 		}
 		if it := inUniverse[sym]; it != nil {
-			s.evaluate(sym, it.Ind, false, cs)
+			s.evaluate(sym, it.Ind, false, gemini.PrioHeld, cs)
 			continue
 		}
 		// Outside the universe or failing the BUY filters (e.g. a low-volume
@@ -413,8 +430,9 @@ func (s *Scheduler) runMarketCycle() {
 			continue
 		}
 		s.noteSector(sym, ind)
-		s.evaluate(sym, ind, true, cs)
+		s.evaluate(sym, ind, true, gemini.PrioHeld, cs)
 	}
+	s.maybeReview(cs, sess)
 	for _, it := range items {
 		if cs.stopGemini {
 			break
@@ -431,7 +449,11 @@ func (s *Scheduler) runMarketCycle() {
 			}
 			continue
 		}
-		s.evaluate(it.Symbol, it.Ind, false, cs)
+		prio := gemini.PrioCandidate
+		if it.Core {
+			prio = gemini.PrioCore
+		}
+		s.evaluate(it.Symbol, it.Ind, false, prio, cs)
 	}
 
 	s.executeDecisions(cs)
@@ -460,9 +482,9 @@ func (s *Scheduler) logCycleSummary(cs *cycleState) {
 		}
 		dropped += ")"
 	}
-	log.Printf("[Cycle] evaluated=%d holds=%d buys=%d sells=%d dropped=%s not-evaluated=%d | trades today %d/%s, week %d/%s | Gemini calls today %d/%d",
+	log.Printf("[Cycle] evaluated=%d holds=%d buys=%d sells=%d dropped=%s not-evaluated=%d | trades today %d/%s, week %d/%s | Gemini %s calls today %d/%d (in-memory count)",
 		cs.evaluated, cs.counts.hold, cs.counts.buy, cs.counts.sell, dropped, skipped,
-		cs.tradesDay, capLabel(s.cfg.MaxTradesPerDay), cs.tradesWeek, capLabel(s.cfg.MaxTradesPerWeek), used, budget)
+		cs.tradesDay, capLabel(s.cfg.MaxTradesPerDay), cs.tradesWeek, capLabel(s.cfg.MaxTradesPerWeek), s.cfg.Gemini.ActiveModel(), used, budget)
 }
 
 // noHeadlineCandidate reports whether it is a screener candidate (not core)
@@ -582,8 +604,9 @@ func (s *Scheduler) buildPortfolio(cs *cycleState) {
 
 // evaluate asks Gemini about one symbol and queues the answer for the
 // end-of-cycle execution pass. sellOnly marks held symbols that are outside
-// the validated universe.
-func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly bool, cs *cycleState) {
+// the validated universe. prio decides how much of the Gemini daily budget
+// the call may use.
+func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly bool, prio gemini.Priority, cs *cycleState) {
 	position := cs.positions[symbol]
 	canBuy := !sellOnly && cs.buyBlock == "" && (position != nil || len(cs.positions) < s.cfg.MaxOpenPositions)
 	if position == nil && !canBuy {
@@ -662,11 +685,18 @@ func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly boo
 		BondETF:    isBond,
 		CashLike:   isBond && bondInfo.CashLike,
 	})
-	decision, err := s.cfg.Gemini.Decide(prompt)
+	decision, err := s.cfg.Gemini.DecideAt(prompt, prio)
 	if err != nil {
-		if errors.Is(err, gemini.ErrQuotaExhausted) || errors.Is(err, gemini.ErrBudgetExhausted) {
+		switch {
+		case errors.Is(err, gemini.ErrBudgetExhausted):
+			// Local budget, not a Google quota. Priorities are ordered so that
+			// everything after this call has a lower ceiling too.
 			cs.stopGemini = true
-			log.Printf("[%s] Gemini unavailable (%v) — no more decisions this cycle", symbol, err)
+			log.Printf("[%s] Gemini budget: %v — no more decisions this cycle", symbol, err)
+			return
+		case errors.Is(err, gemini.ErrQuotaExhausted):
+			cs.stopGemini = true
+			log.Printf("[%s] Gemini quota: %v — no more decisions this cycle", symbol, err)
 			return
 		}
 		log.Printf("[%s] Gemini error: %v", symbol, err)

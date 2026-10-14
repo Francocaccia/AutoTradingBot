@@ -80,7 +80,7 @@ const rules = `RULES:
 - Intraday volume is not available. Use rel_volume (last completed session vs 60-session average) only.
 - Doing nothing is a valid and often the best decision. Most days have no trade worth making. Two or three trades in a week is better than ten in a day. HOLD, or staying in cash, is a position. Do not trade to be active.
 - Single-stock BUY only with a catalyst quoted from the provided news (exact headline text) PLUS a multi-week swing setup with at least 2:1 reward/risk. An oversold or overbought reading alone is never enough. Do not buy short-term bounces.
-- Bond ETF BUY: the "catalyst" must quote a datapoint or the regime label from the PORTFOLIO block (for example "VIX: 27.3" or "risk-off"), and you must justify the duration and credit choice with the regime data. Bonds are not free: in a rising-rate regime long duration loses.
+- Bond ETF BUY: the "catalyst" must be ONE verbatim line copied from the PORTFOLIO block (for example "VIX: 27.3"), or the regime label. Copy it exactly. Never join several lines or phrases together: a concatenation is rejected. You must also justify the duration and credit choice with the regime data. Bonds are not free: in a rising-rate regime long duration loses.
 - SELL only if the thesis is broken (stop logic, catalyst invalidated, fundamental news), not because of one red day or overbought oscillators.
 - Do not reverse a position without a material change since the last action. If nothing new, HOLD.
 - Conviction scale: 5 = no edge, 6-7 = interesting but not actionable, 8+ = rare and actionable. Position size for stocks is derived from conviction by the bot, so be honest.
@@ -170,7 +170,7 @@ Respond ONLY with valid JSON, no markdown, no backticks:
   "role": "core" or "growth" or "income" or "hedge" or "cash_parking" (required for BUY and SELL),
   "thesis": "one sentence",
   "reasoning": "your reasoning, citing the data above",
-  "catalyst": "stock: the exact headline text from RECENT NEWS that supports a BUY; bond ETF: a datapoint or label quoted from the PORTFOLIO block; otherwise the word none",
+  "catalyst": "stock: the exact headline text from RECENT NEWS that supports a BUY; bond ETF: ONE verbatim line from the PORTFOLIO block (never several joined); otherwise the word none",
   "portfolio_rationale": "one or two sentences: why this fits the portfolio and how it changes risk, not just why the asset looks good (required for BUY and SELL)",
   "replaces": "held symbol being rotated out, or empty",
   "take_profit": 0.0,
@@ -194,7 +194,9 @@ type ReviewInput struct {
 	Portfolio string // rendered PORTFOLIO block, no candidate
 	Reason    string // why the review runs now
 	Bonds     []BondOption
-	Held      []string
+	// EquityETFs are the core equity ETFs (SPY, QQQ) the review may also buy.
+	EquityETFs []string
+	Held       []string
 }
 
 // BuildReviewPrompt renders the weekly review prompt.
@@ -207,9 +209,10 @@ func BuildReviewPrompt(in ReviewInput) string {
 - LONG-ONLY cash account. No shorting, margin, leverage or options. SELL closes a whole existing position.
 - Targets are % of equity for equities, bonds and cash and must sum to 100. They must stay inside the IPS bands shown; the bot clips or rejects anything outside.
 - Doing nothing is valid and often best. Return an empty actions list unless a move clearly improves risk-adjusted return. Cash inside its band is NOT a problem and must not trigger buying. If cash is above its band maximum you may propose parking it in SGOV, BIL or SHY.
-- Every action needs a role, a catalyst quoted from the PORTFOLIO block (a datapoint or regime label shown below) and a portfolio_rationale saying how it changes risk. Justify any duration or credit choice with the regime data.
+- Every action needs a role, a catalyst that is ONE verbatim line copied from the PORTFOLIO block (never several joined together) and a portfolio_rationale saying how it changes risk. When a band breach triggered this review the bot sets the catalyst itself, but the rationale is still required. Justify any duration or credit choice with the regime data.
+- A sleeve far outside its band is closed gradually: each BUY is capped at 5% of equity and the bot allows only a few trades a day, so propose only today's moves and expect to continue on later days.
 - If equity risk is elevated (high VIX, SPY below its 200d MA, inverted curve), lean toward shorter-duration bonds and cash rather than forcing equity exposure. Bonds are not free: in a rising-rate regime long duration loses.
-- Act only on held symbols or the bond ETFs listed. Do not add a position highly correlated with what is held unless it replaces it.
+- BUY only the bond ETFs listed (T-bill ETFs park cash) or the core equity ETFs listed (to raise an equity sleeve that is under its band or target); SELL only held symbols. Do not add a position highly correlated with what is held unless it replaces it.
 - Prefer the highest risk-adjusted return, not the highest return.
 
 `)
@@ -221,6 +224,10 @@ func BuildReviewPrompt(in ReviewInput) string {
 			cash = " | cash-like"
 		}
 		sb.WriteString(fmt.Sprintf("- %s: %s | duration %.1fy | credit %s%s\n", b.Symbol, b.Kind, b.Duration, b.Credit, cash))
+	}
+	if len(in.EquityETFs) > 0 {
+		sb.WriteString("\n## CORE EQUITY ETFS YOU MAY BUY\n")
+		sb.WriteString(strings.Join(in.EquityETFs, ", ") + "\n")
 	}
 	sb.WriteString("\n## HELD SYMBOLS\n")
 	if len(in.Held) == 0 {
@@ -235,7 +242,7 @@ Respond ONLY with valid JSON, no markdown, no backticks:
   "targets": {"equities": 60, "bonds": 30, "cash": 10},
   "actions": [
     {"action": "BUY" or "SELL", "symbol": "SGOV", "conviction": 1-10, "role": "core" or "growth" or "income" or "hedge" or "cash_parking",
-     "catalyst": "a datapoint or label quoted from the PORTFOLIO block", "portfolio_rationale": "one or two sentences", "replaces": ""}
+     "catalyst": "ONE verbatim line from the PORTFOLIO block", "portfolio_rationale": "one or two sentences", "replaces": ""}
   ],
   "summary": "one sentence"
 }`)
@@ -284,7 +291,7 @@ func parseReview(text string) (*Review, error) {
 // Review asks Gemini for the weekly portfolio review (one call, same retry
 // and quota handling as Decide).
 func (c *Client) Review(prompt string) (*Review, error) {
-	text, err := c.generate(prompt)
+	text, err := c.generate(prompt, PrioReview)
 	if err != nil {
 		return nil, err
 	}

@@ -259,24 +259,53 @@ func (p Policy) Room(b Book, symbol, sector string) (room float64, binding strin
 	return room, binding
 }
 
+// Breach is the sleeve furthest outside its band.
+type Breach struct {
+	Sleeve string
+	Weight float64 // current % of equity
+	Limit  float64 // the band edge it crossed
+	Above  bool    // true: over the max; false: under the min
+	Pts    float64 // distance outside the band, percentage points; 0 = all inside
+}
+
+// Catalyst is the deterministic, code-built reason for a rebalancing trade.
+func (b Breach) Catalyst() string {
+	if b.Above {
+		return fmt.Sprintf("band breach: %s %.1f%% > %.0f%% max", b.Sleeve, b.Weight, b.Limit)
+	}
+	return fmt.Sprintf("band breach: %s %.1f%% < %.0f%% min", b.Sleeve, b.Weight, b.Limit)
+}
+
+// WorstBreach returns the sleeve furthest outside its band (zero Pts if none).
+func (p Policy) WorstBreach(b Book) Breach {
+	w := b.SleeveWeights()
+	var worst Breach
+	for _, s := range []string{SleeveEquities, SleeveBonds, SleeveCash} {
+		lo, hi := p.Band(s)
+		var d, limit float64
+		var above bool
+		switch {
+		case w[s] > hi:
+			d, limit, above = w[s]-hi, hi, true
+		case w[s] < lo:
+			d, limit = lo-w[s], lo
+		}
+		if d > worst.Pts {
+			worst = Breach{Sleeve: s, Weight: w[s], Limit: limit, Above: above, Pts: d}
+		}
+	}
+	return worst
+}
+
 // BandBreach reports the largest distance, in percentage points, by which a
 // sleeve lies outside its band, with a description. 0 means all inside.
 func (p Policy) BandBreach(b Book) (pts float64, desc string) {
-	w := b.SleeveWeights()
-	for _, s := range []string{SleeveEquities, SleeveBonds, SleeveCash} {
-		lo, hi := p.Band(s)
-		var d float64
-		switch {
-		case w[s] > hi:
-			d = w[s] - hi
-		case w[s] < lo:
-			d = lo - w[s]
-		}
-		if d > pts {
-			pts, desc = d, fmt.Sprintf("%s %.1f%% vs band %.0f-%.0f%%", s, w[s], lo, hi)
-		}
+	w := p.WorstBreach(b)
+	if w.Pts == 0 {
+		return 0, ""
 	}
-	return pts, desc
+	lo, hi := p.Band(w.Sleeve)
+	return w.Pts, fmt.Sprintf("%s %.1f%% vs band %.0f-%.0f%%", w.Sleeve, w.Weight, lo, hi)
 }
 
 // ClipTargets forces proposed sleeve targets (% of equity) into the bands. It

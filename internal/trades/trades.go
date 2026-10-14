@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/francocaccia/quantengine/internal/broker"
@@ -33,14 +34,48 @@ type Fill struct {
 	Type   string // order type: market, limit, stop, ...
 	At     time.Time
 	Qty    float64
+
+	ClientOrderID string // "atb-..." on orders the bot submitted itself
+	OrderClass    string // "", simple, bracket, oto, ...
+	ParentID      string // set on bracket / OTO child legs
 }
 
 // IsDecision reports whether the fill came from one of the bot's own
-// decisions rather than a bracket leg. The bot opens positions with a market
-// buy (parent of a bracket) and closes them with a plain market sell; its
-// stop-loss and take-profit legs are stop/limit sells.
+// decisions rather than a bracket leg, a stop/limit fill or a manual order.
+//
+//   - Child legs (ParentID set) never count.
+//   - An order whose client_order_id carries broker.ClientOrderPrefix counts.
+//   - A legacy order without the prefix counts only when it is a parent order
+//     (class "", simple, bracket or oto) shaped like one of the bot's decisions:
+//     a market buy, or a plain market sell. Stop and limit fills are exits.
 func (f Fill) IsDecision() bool {
-	return f.Side == "buy" || (f.Side == "sell" && f.Type == "market")
+	if f.ParentID != "" {
+		return false
+	}
+	if strings.HasPrefix(f.ClientOrderID, broker.ClientOrderPrefix) {
+		return true
+	}
+	switch f.OrderClass {
+	case "", "simple":
+		return (f.Side == "buy" || f.Side == "sell") && f.Type == "market"
+	case "bracket", "oto":
+		// The bot only opens bracket / OTO orders (buys); a sell in these
+		// classes is an exit leg even if the parent link is missing.
+		return f.Side == "buy" && f.Type == "market"
+	}
+	return false
+}
+
+// countKind labels why a fill was or was not counted, for the startup log.
+func (f Fill) exclusionReason() string {
+	switch {
+	case f.ParentID != "":
+		return "bracket/OTO leg"
+	case f.Type == "stop" || f.Type == "stop_limit" || f.Type == "limit" || f.Type == "trailing_stop":
+		return "stop/limit fill"
+	default:
+		return "not a bot decision"
+	}
 }
 
 // Source supplies order history and the exchange calendar.
@@ -52,15 +87,23 @@ type Source interface {
 	TradingDays(start, end time.Time) ([]string, error)
 }
 
+// FormatET formats t as an Eastern-time timestamp for logs.
+func FormatET(t time.Time) string { return t.In(eastern).Format("2006-01-02 15:04 MST") }
+
 // Date formats t as an Eastern-time calendar date.
 func Date(t time.Time) string { return t.In(eastern).Format("2006-01-02") }
 
 // Snapshot is the order history and trading calendar as of one moment.
 type Snapshot struct {
-	fills []Fill   // oldest first
-	days  []string // trading dates, ascending, ending at the last one <= today
-	today string
+	fills     []Fill   // oldest first
+	days      []string // trading dates, ascending, ending at the last one <= today
+	today     string
+	countFrom string // ET date (YYYY-MM-DD); decisions before it do not count toward the caps
 }
+
+// SetCountStart makes decisions dated before date (YYYY-MM-DD, Eastern) stop
+// counting toward the daily and weekly caps (GUARDS_START_DATE). "" counts all.
+func (s *Snapshot) SetCountStart(date string) { s.countFrom = date }
 
 // Load reads history from src as of now. A fill-history failure is returned;
 // a calendar failure silently falls back to weekdays.
@@ -164,30 +207,74 @@ func (s *Snapshot) SinceLastSell(symbol string) (days int, ok bool) {
 // weekly turnover window.
 const WeekWindow = 5
 
-// DecisionCounts returns how many of the bot's own orders (see IsDecision)
-// filled today and within the last WeekWindow trading days.
-func (s *Snapshot) DecisionCounts() (today, week int) {
-	weekStart := s.today
+// weekStart is the first trading day of the rolling WeekWindow.
+func (s *Snapshot) weekStart() string {
 	if n := len(s.days); n > 0 {
 		i := n - WeekWindow
 		if i < 0 {
 			i = 0
 		}
-		weekStart = s.days[i]
+		return s.days[i]
 	}
+	return s.today
+}
+
+// counts reports whether f counts toward the caps and on which windows.
+func (s *Snapshot) counts(f Fill) (counted, today, week bool) {
+	if !f.IsDecision() {
+		return false, false, false
+	}
+	d := Date(f.At)
+	if d < s.countFrom {
+		return false, false, false
+	}
+	today = d == s.today
+	week = d >= s.weekStart() && d <= s.today
+	return today || week, today, week
+}
+
+// DecisionCounts returns how many of the bot's own orders (see IsDecision)
+// filled today and within the last WeekWindow trading days, ignoring any
+// before the count start (SetCountStart).
+func (s *Snapshot) DecisionCounts() (today, week int) {
 	for _, f := range s.fills {
-		if !f.IsDecision() {
-			continue
-		}
-		d := Date(f.At)
-		if d == s.today {
+		_, t, w := s.counts(f)
+		if t {
 			today++
 		}
-		if d >= weekStart && d <= s.today {
+		if w {
 			week++
 		}
 	}
 	return today, week
+}
+
+// Breakdown explains DecisionCounts: the fills that were counted and how many
+// others in the same window were left out, by reason.
+type Breakdown struct {
+	WeekStart string
+	CountFrom string
+	Counted   []Fill
+	Excluded  map[string]int
+}
+
+// DecisionBreakdown lists what DecisionCounts counted over the weekly window.
+func (s *Snapshot) DecisionBreakdown() Breakdown {
+	b := Breakdown{WeekStart: s.weekStart(), CountFrom: s.countFrom, Excluded: map[string]int{}}
+	for _, f := range s.fills {
+		d := Date(f.At)
+		if d < b.WeekStart || d > s.today {
+			continue
+		}
+		if counted, _, _ := s.counts(f); counted {
+			b.Counted = append(b.Counted, f)
+		} else if f.IsDecision() {
+			b.Excluded["before GUARDS_START_DATE"]++
+		} else {
+			b.Excluded[f.exclusionReason()]++
+		}
+	}
+	return b
 }
 
 // AlpacaSource implements Source on the Alpaca paper API.
@@ -205,14 +292,17 @@ func (a AlpacaSource) Fills(since time.Time) ([]Fill, error) {
 			return nil, err
 		}
 		var raw []struct {
-			ID          string  `json:"id"`
-			Symbol      string  `json:"symbol"`
-			Side        string  `json:"side"`
-			Type        string  `json:"type"`
-			Status      string  `json:"status"`
-			FilledQty   string  `json:"filled_qty"`
-			FilledAt    *string `json:"filled_at"`
-			SubmittedAt string  `json:"submitted_at"`
+			ID            string  `json:"id"`
+			ClientOrderID string  `json:"client_order_id"`
+			OrderClass    string  `json:"order_class"`
+			ParentOrderID string  `json:"parent_order_id"`
+			Symbol        string  `json:"symbol"`
+			Side          string  `json:"side"`
+			Type          string  `json:"type"`
+			Status        string  `json:"status"`
+			FilledQty     string  `json:"filled_qty"`
+			FilledAt      *string `json:"filled_at"`
+			SubmittedAt   string  `json:"submitted_at"`
 		}
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return nil, err
@@ -230,7 +320,8 @@ func (a AlpacaSource) Fills(since time.Time) ([]Fill, error) {
 			if err != nil || qty <= 0 {
 				continue
 			}
-			out = append(out, Fill{Symbol: r.Symbol, Side: r.Side, Type: r.Type, At: at, Qty: qty})
+			out = append(out, Fill{Symbol: r.Symbol, Side: r.Side, Type: r.Type, At: at, Qty: qty,
+				ClientOrderID: r.ClientOrderID, OrderClass: r.OrderClass, ParentID: r.ParentOrderID})
 		}
 		if len(raw) < 500 {
 			break

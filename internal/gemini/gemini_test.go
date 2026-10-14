@@ -156,7 +156,7 @@ func equalDurations(a, b []time.Duration) bool {
 const quotaBody = `{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}`
 
 func TestQuota429IsNotRetriedAndPausesUntilLAMidnight(t *testing.T) {
-	c, paths, sleeps := newTestClient(t, "fallback-model", []step{{429, quotaBody}, {200, okBody}})
+	c, paths, sleeps := newTestClient(t, "", []step{{429, quotaBody}, {200, okBody}})
 	clock := time.Date(2026, 10, 12, 18, 0, 0, 0, time.UTC) // 11:00 in Los Angeles
 	c.now = func() time.Time { return clock }
 

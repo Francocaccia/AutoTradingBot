@@ -40,6 +40,10 @@ const (
 	defaultMaxTradesDay     = 2
 	defaultMaxTradesWeek    = 5
 	defaultEvalCooldownMin  = 90
+
+	// defaultGuardsStartDate is the deploy date of the "atb-" order tagging:
+	// decisions before it do not count toward the daily/weekly caps.
+	defaultGuardsStartDate = "2026-10-14"
 )
 
 var coreWatchlist = []string{"SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOG"}
@@ -53,7 +57,7 @@ func main() {
 	alpacaClient := broker.NewAlpacaClient(apiKey, apiSecret, os.Getenv("ALPACA_BASE_URL"))
 	newsClient := news.NewAlpacaNewsClient(apiKey, apiSecret)
 	dataClient := marketdata.NewClient(apiKey, apiSecret)
-	geminiClient := gemini.NewClient(os.Getenv("GEMINI_API_KEY"), os.Getenv("GEMINI_FALLBACK_MODEL"))
+	geminiClient := gemini.NewClient(os.Getenv("GEMINI_API_KEY"), envString("GEMINI_FALLBACK_MODEL", gemini.DefaultFallbackModel))
 	geminiClient.SetLimits(envPositive("GEMINI_MAX_RPM", gemini.DefaultMaxRPM), envPositive("GEMINI_DAILY_BUDGET", gemini.DefaultDailyBudget))
 	port := portfolio.NewPortfolio(alpacaClient)
 
@@ -96,6 +100,7 @@ func main() {
 		ReentryCooldownDays: envInt("REENTRY_COOLDOWN_DAYS", defaultReentryDays),
 		MaxTradesPerDay:     envPositive("MAX_TRADES_PER_DAY", defaultMaxTradesDay),
 		MaxTradesPerWeek:    envPositive("MAX_TRADES_PER_WEEK", defaultMaxTradesWeek),
+		GuardsStartDate:     envDate("GUARDS_START_DATE", defaultGuardsStartDate),
 		History:             trades.AlpacaSource{Broker: alpacaClient},
 		Policy:              policy,
 		Bonds:               bonds,
@@ -140,6 +145,19 @@ func envString(name, def string) string {
 		return v
 	}
 	return def
+}
+
+// envDate reads an ISO date (YYYY-MM-DD), keeping def when unset or invalid.
+func envDate(name, def string) string {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	if _, err := time.Parse("2006-01-02", v); err != nil {
+		log.Printf("Invalid %s %q (want YYYY-MM-DD), using default %s", name, v, def)
+		return def
+	}
+	return v
 }
 
 // envFloat reads a non-negative float env var, keeping def when unset or invalid.

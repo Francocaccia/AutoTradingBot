@@ -9,7 +9,6 @@ import (
 
 	"github.com/francocaccia/quantengine/internal/broker"
 	"github.com/francocaccia/quantengine/internal/gemini"
-	"github.com/francocaccia/quantengine/internal/indicators"
 	"github.com/francocaccia/quantengine/internal/portfolio"
 	"github.com/francocaccia/quantengine/internal/risk"
 )
@@ -47,15 +46,45 @@ func normQuote(s string) string {
 	return strings.ToLower(strings.Trim(strings.TrimSpace(s), "\"'“”‘’ "))
 }
 
-// macroCatalystMatches reports whether a bond-ETF catalyst is a datapoint or
-// label actually printed in the PORTFOLIO block (case-insensitive substring).
-// Placeholder text such as "unavailable" is never a valid catalyst.
+// normMacro lowercases, trims surrounding quotes and collapses whitespace.
+func normMacro(s string) string {
+	return strings.Join(strings.Fields(normQuote(s)), " ")
+}
+
+// macroCatalystMatches reports whether a bond-ETF (or review) catalyst is ONE
+// item printed in the PORTFOLIO block: a full line, or a single " | "-separated
+// "label: value" token of a line (for the macro regime line, also its label
+// alone, e.g. "risk-off, inverted curve"). Case and whitespace are normalized.
+// A concatenation of several lines or phrases never matches, and placeholder
+// text such as "unavailable" is never a valid catalyst.
 func macroCatalystMatches(catalyst, block string) bool {
-	c := normQuote(catalyst)
+	c := normMacro(catalyst)
 	if len(c) < minMacroCatalystLen || c == "none" || strings.Contains(c, "unavailable") || strings.Contains(c, "n/a") {
 		return false
 	}
-	return strings.Contains(strings.ToLower(block), c)
+	for _, line := range strings.Split(block, "\n") {
+		line = normMacro(line)
+		if line == "" || strings.HasPrefix(line, "## ") {
+			continue
+		}
+		if c == line {
+			return true
+		}
+		for i, token := range strings.Split(line, " | ") {
+			token = strings.TrimSpace(token)
+			if c == token {
+				return true
+			}
+			// "Sleeves vs IPS bands (% of equity): equities 60.0% (...)": the first
+			// token also counts without its line label, as does the regime label.
+			if i == 0 {
+				if _, value, ok := strings.Cut(token, ": "); ok && c == strings.TrimSpace(value) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // capRoom reports whether n more orders fit under both turnover caps.
@@ -124,10 +153,18 @@ func (s *Scheduler) buyEligibility(p *pendingDecision, cs *cycleState) (why, key
 		if !cs.regimeAvailable() && !portfolio.SafeWithoutMacro[bond.Symbol] {
 			return fmt.Sprintf("macro regime unavailable: only SGOV, BIL and SHY may be bought (not %s)", p.symbol), "macro-unavailable"
 		}
+	}
+	// Catalyst. A rebalance BUY (caused by a band breach) carries a catalyst the
+	// code wrote itself, so nothing is checked. A bond ETF, or any review
+	// action, must quote ONE item of the PORTFOLIO block; a stock must quote a
+	// headline it was shown.
+	switch {
+	case p.rebalance:
+	case isBond || p.fromReview:
 		if !macroCatalystMatches(d.Catalyst, p.portfolioText) {
-			return fmt.Sprintf("no verified macro catalyst (%q is not a datapoint or label in the PORTFOLIO block)", d.Catalyst), "catalyst"
+			return fmt.Sprintf("no verified macro catalyst (%q is not one line or one \"label: value\" item of the PORTFOLIO block)", d.Catalyst), "catalyst"
 		}
-	} else if !catalystMatches(d.Catalyst, p.headlines) {
+	case !catalystMatches(d.Catalyst, p.headlines):
 		return fmt.Sprintf("no verified catalyst (%q is not one of the %d headlines shown)", d.Catalyst, len(p.headlines)), "catalyst"
 	}
 
@@ -147,8 +184,11 @@ func (s *Scheduler) buyEligibility(p *pendingDecision, cs *cycleState) (why, key
 		}
 	}
 
-	// Highly correlated with what is held: only as a rotation out of a held symbol.
-	if p.corr != nil && p.corr.Avg > maxCorrelation && !s.validReplaces(p, cs) {
+	// Highly correlated with what is held: only as a rotation out of a held
+	// symbol. A rebalance BUY is exempt: raising a sleeve that is below its
+	// band necessarily adds exposure correlated with the holdings, and the
+	// code (not the model) chose to do it.
+	if p.corr != nil && p.corr.Avg > maxCorrelation && !p.rebalance && !s.validReplaces(p, cs) {
 		return fmt.Sprintf("average 60d correlation to holdings %.2f exceeds %.1f and no valid \"replaces\" (%q)", p.corr.Avg, maxCorrelation, d.Replaces), "correlation"
 	}
 	return "", ""
@@ -284,7 +324,7 @@ func (s *Scheduler) execBuy(p pendingDecision, cs *cycleState) {
 	if _, isBond := portfolio.BondInfoFor(p.symbol); isBond {
 		placed = s.placeBondBuy(p, cs)
 	} else {
-		placed = s.placeBuy(p.symbol, p.ind, cs.positions[p.symbol], p.decision, cs)
+		placed = s.placeBuy(p, cs)
 	}
 	if placed {
 		cs.tradesDay++
@@ -294,7 +334,9 @@ func (s *Scheduler) execBuy(p pendingDecision, cs *cycleState) {
 
 // placeBuy sizes and submits a bracket BUY of a stock or equity ETF. It
 // reports whether an order was placed.
-func (s *Scheduler) placeBuy(symbol string, ind *indicators.Result, position *portfolio.Position, decision *gemini.Decision, cs *cycleState) bool {
+func (s *Scheduler) placeBuy(p pendingDecision, cs *cycleState) bool {
+	symbol, ind, decision := p.symbol, p.ind, p.decision
+	position := cs.positions[symbol]
 	levels, err := risk.Bracket(ind.Price, ind.ATR, decision.TakeProfit)
 	if err != nil {
 		cs.drop(symbol, "BUY", "bracket", fmt.Sprintf("rejected: %v", err))
@@ -338,6 +380,24 @@ func (s *Scheduler) placeBuy(symbol string, ind *indicators.Result, position *po
 		qty = maxQty
 	}
 
+	// A review BUY (an equity ETF raising its sleeve) is a step toward the
+	// sleeve target: at most bondStepPct of equity, never past the target.
+	if p.fromReview {
+		step, key, why := s.sleeveStep(symbol, s.bookFrom(cs, acct), acct.Equity)
+		if key != "" {
+			cs.drop(symbol, "BUY", key, why)
+			return false
+		}
+		if maxQty := int(math.Floor(step/ind.Price + 1e-9)); maxQty < qty {
+			if maxQty < 1 {
+				cs.drop(symbol, "BUY", "ips", "size below one share after the stepwise rebalance cap")
+				return false
+			}
+			log.Printf("[%s] BUY quantity cut from %d to %d (review step: at most %.0f%% of equity)", symbol, qty, maxQty, bondStepPct)
+			qty = maxQty
+		}
+	}
+
 	// Per-trade risk: the loss if the stop is hit may not exceed MAX_RISK_PCT of equity.
 	if capped, stopPct := risk.CapQtyByRisk(qty, ind.Price, levels.Stop, acct.Equity, s.cfg.MaxRiskPct); capped < qty {
 		if capped < 1 {
@@ -355,7 +415,41 @@ func (s *Scheduler) placeBuy(symbol string, ind *indicators.Result, position *po
 	}
 	log.Printf("[%s] BUY %d shares @ ~$%.2f (bracket stop=%.2f take=%.2f R:R=%.1f)", symbol, qty, ind.Price, levels.Stop, levels.Take, levels.RewardRisk)
 	s.recordBuy(cs, symbol, position, qty, ind.Price)
+	if p.rebalance {
+		s.logRebalance(cs, acct, float64(qty)*ind.Price)
+	}
 	return true
+}
+
+// sleeveStep is the most a single review / bond purchase of sym may add: at
+// most bondStepPct of equity, and for the bond and equity sleeves no more than
+// the gap to the sleeve target (key != "" when the sleeve is already at or
+// above it). The cash sleeve (T-bill ETFs) has no gap check: parking cash is
+// governed by the cash band instead.
+func (s *Scheduler) sleeveStep(sym string, book portfolio.Book, equity float64) (value float64, key, why string) {
+	value = equity * bondStepPct / 100
+	if sleeve := portfolio.Sleeve(sym); sleeve != portfolio.SleeveCash {
+		w := book.SleeveWeights()[sleeve]
+		gap := (s.policy.Target(sleeve) - w) / 100 * equity
+		if gap <= 0 {
+			return 0, "sleeve-target", fmt.Sprintf("%s sleeve %.1f%% is at or above its %.0f%% target", sleeve, w, s.policy.Target(sleeve))
+		}
+		value = math.Min(value, gap)
+	}
+	return value, "", ""
+}
+
+// logRebalance reports how far the book still is from its bands after a
+// rebalance BUY that spent `spent` dollars of cash (acct is the pre-order account).
+func (s *Scheduler) logRebalance(cs *cycleState, acct *portfolio.Account, spent float64) {
+	after := *acct
+	after.Cash -= spent
+	if pts, desc := s.policy.BandBreach(s.bookFrom(cs, &after)); pts > 0 {
+		log.Printf("[Rebalance] rebalance in progress, %.1f points remaining (%s); at most %.0f%% of equity per trade and %s trades a day",
+			pts, desc, bondStepPct, capLabel(s.cfg.MaxTradesPerDay))
+	} else {
+		log.Printf("[Rebalance] complete: every sleeve is back inside its band")
+	}
 }
 
 // recordBuy reflects a placed BUY in the cycle's position map so later orders
@@ -389,15 +483,10 @@ func (s *Scheduler) placeBondBuy(p pendingDecision, cs *cycleState) bool {
 	}
 	book := s.bookFrom(cs, acct)
 
-	step := acct.Equity * bondStepPct / 100
-	if sleeve := portfolio.Sleeve(sym); sleeve == portfolio.SleeveBonds {
-		w := book.SleeveWeights()[sleeve]
-		gap := (s.policy.Target(sleeve) - w) / 100 * acct.Equity
-		if gap <= 0 {
-			cs.drop(sym, "BUY", "sleeve-target", fmt.Sprintf("bond sleeve %.1f%% is at or above its %.0f%% target", w, s.policy.Target(sleeve)))
-			return false
-		}
-		step = math.Min(step, gap)
+	step, key, why := s.sleeveStep(sym, book, acct.Equity)
+	if key != "" {
+		cs.drop(sym, "BUY", key, why)
+		return false
 	}
 	room, bind := s.policy.Room(book, sym, "")
 	value := math.Min(math.Min(step, room), acct.Spendable())
@@ -418,6 +507,9 @@ func (s *Scheduler) placeBondBuy(p pendingDecision, cs *cycleState) bool {
 		}
 		log.Printf("[%s] BUY %d shares @ ~$%.2f (cash-like ETF, no bracket, %.1f%% of equity)", sym, qty, ind.Price, float64(qty)*ind.Price/acct.Equity*100)
 		s.recordBuy(cs, sym, cs.positions[sym], qty, ind.Price)
+		if p.rebalance {
+			s.logRebalance(cs, acct, float64(qty)*ind.Price)
+		}
 		return true
 	}
 
@@ -442,6 +534,9 @@ func (s *Scheduler) placeBondBuy(p pendingDecision, cs *cycleState) bool {
 	log.Printf("[%s] BUY %d shares @ ~$%.2f (bond ETF, %.0fx ATR stop=%.2f, no take-profit, %.1f%% of equity)",
 		sym, qty, ind.Price, risk.BondStopATRMultiple, stop, float64(qty)*ind.Price/acct.Equity*100)
 	s.recordBuy(cs, sym, cs.positions[sym], qty, ind.Price)
+	if p.rebalance {
+		s.logRebalance(cs, acct, float64(qty)*ind.Price)
+	}
 	return true
 }
 
