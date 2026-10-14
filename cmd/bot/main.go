@@ -40,6 +40,7 @@ const (
 	defaultMaxTradesDay     = 2
 	defaultMaxTradesWeek    = 5
 	defaultEvalCooldownMin  = 90
+	defaultBatchMaxSymbols  = 12
 
 	// defaultGuardsStartDate is the deploy date of the "atb-" order tagging:
 	// decisions before it do not count toward the daily/weekly caps.
@@ -57,8 +58,10 @@ func main() {
 	alpacaClient := broker.NewAlpacaClient(apiKey, apiSecret, os.Getenv("ALPACA_BASE_URL"))
 	newsClient := news.NewAlpacaNewsClient(apiKey, apiSecret)
 	dataClient := marketdata.NewClient(apiKey, apiSecret)
-	geminiClient := gemini.NewClient(os.Getenv("GEMINI_API_KEY"), envString("GEMINI_FALLBACK_MODEL", gemini.DefaultFallbackModel))
+	geminiClient := gemini.NewClient(os.Getenv("GEMINI_API_KEY"), envString("GEMINI_MODEL", gemini.DefaultModel), envString("GEMINI_FALLBACK_MODEL", gemini.DefaultFallbackModel))
 	geminiClient.SetLimits(envPositive("GEMINI_MAX_RPM", gemini.DefaultMaxRPM), envPositive("GEMINI_DAILY_BUDGET", gemini.DefaultDailyBudget))
+	// GET /models does not use generate quota: drop configured models that do not exist.
+	geminiClient.VerifyModels()
 	port := portfolio.NewPortfolio(alpacaClient)
 
 	tracker := stats.New(stats.AlpacaSource{Broker: alpacaClient, MarketData: dataClient}, envString("TRACK_START_DATE", stats.DefaultStartDate))
@@ -93,6 +96,7 @@ func main() {
 		Debug:            strings.EqualFold(os.Getenv("LOG_LEVEL"), "debug"),
 		CycleInterval:    time.Duration(envPositive("CYCLE_INTERVAL_MIN", defaultCycleMin)) * time.Minute,
 		EvalCooldown:     time.Duration(envInt("EVAL_COOLDOWN_MIN", defaultEvalCooldownMin)) * time.Minute,
+		BatchMaxSymbols:  envPositive("BATCH_MAX_SYMBOLS", defaultBatchMaxSymbols),
 
 		MaxRiskPct:          envFloat("MAX_RISK_PCT", risk.DefaultMaxRiskPct),
 		MinBuyConviction:    envPositive("MIN_BUY_CONVICTION", defaultMinBuyConviction),

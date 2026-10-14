@@ -42,7 +42,7 @@ func newTestClient(t *testing.T, fallback string, steps []step) (c *Client, path
 		w.Write([]byte(s.body))
 	}))
 	t.Cleanup(srv.Close)
-	c = NewClient("key", fallback)
+	c = NewClient("key", DefaultModel, fallback)
 	c.baseURL = srv.URL
 	c.sleep = func(d time.Duration) { sl = append(sl, d) }
 	return c, &p, &sl
@@ -76,12 +76,12 @@ func TestDecideRetriesEmptyResponse(t *testing.T) {
 }
 
 func TestDecideDoesNotRetryOther4xx(t *testing.T) {
-	c, paths, sleeps := newTestClient(t, "fallback-model", []step{{400, `{"error":"bad"}`}})
+	c, paths, sleeps := newTestClient(t, "fallback-model", []step{{401, `{"error":"bad key"}`}})
 	if _, err := c.Decide("p"); err == nil {
 		t.Fatal("expected error")
 	}
 	if len(*paths) != 1 || len(*sleeps) != 0 {
-		t.Fatalf("400 must not retry or fall back: %d requests, sleeps %v", len(*paths), *sleeps)
+		t.Fatalf("401 must not retry or fall back: %d requests, sleeps %v", len(*paths), *sleeps)
 	}
 }
 
@@ -109,7 +109,7 @@ func TestDecideFallsBackOnce(t *testing.T) {
 		t.Fatalf("unexpected decision %+v", d)
 	}
 	n := len(*paths)
-	if n != 5 || !strings.Contains((*paths)[n-1], "gemini-lite") || !strings.Contains((*paths)[0], primaryModel) {
+	if n != 5 || !strings.Contains((*paths)[n-1], "gemini-lite") || !strings.Contains((*paths)[0], DefaultModel) {
 		t.Fatalf("unexpected request paths %v", *paths)
 	}
 
@@ -207,7 +207,7 @@ func TestPerMinute429HonorsRetryAfter(t *testing.T) {
 	}))
 	defer srv.Close()
 	var sleeps []time.Duration
-	c := NewClient("key", "")
+	c := NewClient("key", "", "")
 	c.baseURL = srv.URL
 	c.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
 	if _, err := c.Decide("p"); err != nil {
@@ -221,25 +221,27 @@ func TestPerMinute429HonorsRetryAfter(t *testing.T) {
 	}
 }
 
-func TestDailyBudgetCountsRetriesAndResets(t *testing.T) {
+func TestDailyBudgetCountsOnlySuccessfulCallsAndResets(t *testing.T) {
 	c, paths, _ := newTestClient(t, "", []step{{503, `{}`}, {200, okBody}})
 	clock := time.Date(2026, 10, 12, 18, 0, 0, 0, time.UTC)
 	c.now = func() time.Time { return clock }
 	c.SetLimits(100, 3)
 
-	if _, err := c.Decide("p"); err != nil { // 503 + 200 = 2 requests
+	if _, err := c.Decide("p"); err != nil { // 503 (not counted) + 200
 		t.Fatal(err)
 	}
-	if used, budget := c.Usage(); used != 2 || budget != 3 {
-		t.Fatalf("usage %d/%d, want 2/3", used, budget)
+	if used, budget := c.Usage(); used != 1 || budget != 3 {
+		t.Fatalf("usage %d/%d, want 1/3: the 503 must not count", used, budget)
 	}
-	if _, err := c.Decide("p"); err != nil { // third request
-		t.Fatal(err)
+	for i := 0; i < 2; i++ {
+		if _, err := c.Decide("p"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := c.Decide("p"); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("want ErrBudgetExhausted, got %v", err)
 	}
-	if len(*paths) != 3 {
+	if len(*paths) != 4 { // 503 + three 200s; the fourth call never left the process
 		t.Fatalf("budget cap exceeded: %d requests", len(*paths))
 	}
 	if p, why := c.Paused(); !p || why == "" {

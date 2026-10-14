@@ -55,6 +55,9 @@ type PromptInput struct {
 	// target, with a wider stop and no take-profit (cash-like ETFs: no stop).
 	BondETF  bool
 	CashLike bool
+	// MaxHeadlines caps the RECENT NEWS lines shown (0 = MaxPromptHeadlines).
+	// The catalyst check must use the same count.
+	MaxHeadlines int
 }
 
 // LastDecision is the bot's previous answer for a symbol (best effort, in memory).
@@ -98,7 +101,29 @@ func BuildPrompt(input PromptInput) string {
 	sb.WriteString(goal)
 	sb.WriteString(fmt.Sprintf("Make a decision for %s based ONLY on the context below.\n\n", input.Symbol))
 	sb.WriteString(rules)
+	writeContext(&sb, input)
+	sb.WriteString(`
+## RESPONSE FORMAT
+Respond ONLY with valid JSON, no markdown, no backticks:
+{
+  "action": "BUY" or "SELL" or "HOLD",
+  "conviction": 1-10 (integer; confidence in the chosen action),
+  "role": "core" or "growth" or "income" or "hedge" or "cash_parking" (required for BUY and SELL),
+  "thesis": "one sentence",
+  "reasoning": "your reasoning, citing the data above",
+  "catalyst": "stock: the exact headline text from RECENT NEWS that supports a BUY; bond ETF: ONE verbatim line from the PORTFOLIO block (never several joined); otherwise the word none",
+  "portfolio_rationale": "one or two sentences: why this fits the portfolio and how it changes risk, not just why the asset looks good (required for BUY and SELL)",
+  "replaces": "held symbol being rotated out, or empty",
+  "take_profit": 0.0,
+  "suggested_tickers": []
+}
+"suggested_tickers": optional, up to 3 other US-listed stock/ETF symbols from the news above worth evaluating next cycle. They are validated by code before anything is traded.`)
+	return sb.String()
+}
 
+// writeContext renders one symbol's context: technicals, position, last
+// decision, the portfolio text, risk and news.
+func writeContext(sb *strings.Builder, input PromptInput) {
 	if input.Indicators != nil {
 		ind := input.Indicators
 		sb.WriteString("## TECHNICALS\n")
@@ -154,30 +179,17 @@ func BuildPrompt(input PromptInput) string {
 	if len(input.News) == 0 {
 		sb.WriteString("(none available)\n")
 	}
+	limit := input.MaxHeadlines
+	if limit <= 0 {
+		limit = MaxPromptHeadlines
+	}
 	for i, a := range input.News {
-		if i >= MaxPromptHeadlines {
+		if i >= limit {
 			break
 		}
 		sb.WriteString(fmt.Sprintf("- [%s] %s\n", a.Source, a.Headline))
 	}
 
-	sb.WriteString(`
-## RESPONSE FORMAT
-Respond ONLY with valid JSON, no markdown, no backticks:
-{
-  "action": "BUY" or "SELL" or "HOLD",
-  "conviction": 1-10 (integer; confidence in the chosen action),
-  "role": "core" or "growth" or "income" or "hedge" or "cash_parking" (required for BUY and SELL),
-  "thesis": "one sentence",
-  "reasoning": "your reasoning, citing the data above",
-  "catalyst": "stock: the exact headline text from RECENT NEWS that supports a BUY; bond ETF: ONE verbatim line from the PORTFOLIO block (never several joined); otherwise the word none",
-  "portfolio_rationale": "one or two sentences: why this fits the portfolio and how it changes risk, not just why the asset looks good (required for BUY and SELL)",
-  "replaces": "held symbol being rotated out, or empty",
-  "take_profit": 0.0,
-  "suggested_tickers": []
-}
-"suggested_tickers": optional, up to 3 other US-listed stock/ETF symbols from the news above worth evaluating next cycle. They are validated by code before anything is traded.`)
-	return sb.String()
 }
 
 // BondOption is one buyable bond ETF shown to the weekly review.
@@ -291,7 +303,7 @@ func parseReview(text string) (*Review, error) {
 // Review asks Gemini for the weekly portfolio review (one call, same retry
 // and quota handling as Decide).
 func (c *Client) Review(prompt string) (*Review, error) {
-	text, err := c.generate(prompt, PrioReview)
+	text, err := c.generate(prompt, PrioReview, nil)
 	if err != nil {
 		return nil, err
 	}

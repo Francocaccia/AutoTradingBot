@@ -70,7 +70,7 @@ func TestPerMinute429UsesRetryInfoDelay(t *testing.T) {
 	defer srv.Close()
 	logs := captureLog(t)
 	var sleeps []time.Duration
-	c := NewClient("key", "")
+	c := NewClient("key", "", "")
 	c.baseURL = srv.URL
 	c.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
 	if _, err := c.Decide("p"); err != nil {
@@ -118,7 +118,7 @@ func TestDailyQuotaSwitchesToFallbackForTheRestOfTheDay(t *testing.T) {
 	if _, err := c.Decide("p"); err != nil {
 		t.Fatalf("fallback should serve the call: %v", err)
 	}
-	if len(*paths) != 2 || !strings.Contains((*paths)[0], primaryModel+":") || !strings.Contains((*paths)[1], "gemini-2.5-flash-lite") || len(*sleeps) != 0 {
+	if len(*paths) != 2 || !strings.Contains((*paths)[0], DefaultModel+":") || !strings.Contains((*paths)[1], "gemini-2.5-flash-lite") || len(*sleeps) != 0 {
 		t.Fatalf("paths %v sleeps %v", *paths, *sleeps)
 	}
 	if p, _ := c.Paused(); p {
@@ -132,13 +132,13 @@ func TestDailyQuotaSwitchesToFallbackForTheRestOfTheDay(t *testing.T) {
 	if _, err := c.Decide("p"); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(*paths); n != 3 || strings.Contains((*paths)[2], primaryModel+":") {
+	if n := len(*paths); n != 3 || strings.Contains((*paths)[2], DefaultModel+":") {
 		t.Fatalf("primary must not be called again today: %v", *paths)
 	}
 
 	// Next LA day: back to the primary.
 	clock = time.Date(2026, 10, 13, 8, 0, 0, 0, time.UTC)
-	if c.ActiveModel() != primaryModel {
+	if c.ActiveModel() != DefaultModel {
 		t.Errorf("active model after reset = %s", c.ActiveModel())
 	}
 }
@@ -219,7 +219,7 @@ func TestDefaultBudgetIs18(t *testing.T) {
 	if DefaultDailyBudget != 18 {
 		t.Errorf("DefaultDailyBudget = %d, want 18", DefaultDailyBudget)
 	}
-	if got := NewClient("k", "").dailyBudget; got != 18 {
+	if got := NewClient("k", "", "").dailyBudget; got != 18 {
 		t.Errorf("new client budget = %d", got)
 	}
 }
