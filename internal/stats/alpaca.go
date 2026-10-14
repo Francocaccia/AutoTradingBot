@@ -9,6 +9,7 @@ import (
 
 	"github.com/francocaccia/quantengine/internal/broker"
 	"github.com/francocaccia/quantengine/internal/marketdata"
+	"github.com/francocaccia/quantengine/internal/portfolio"
 )
 
 // AlpacaSource implements Source on the Alpaca paper API and IEX market data.
@@ -16,8 +17,6 @@ type AlpacaSource struct {
 	Broker     *broker.AlpacaClient
 	MarketData *marketdata.Client
 }
-
-const benchmarkSymbol = "SPY"
 
 // EquityHistory returns end-of-day account equity covering at least the last days days.
 func (a AlpacaSource) EquityHistory(days int) ([]Point, error) {
@@ -46,9 +45,9 @@ func (a AlpacaSource) EquityHistory(days int) ([]Point, error) {
 	return dedupe(out), nil
 }
 
-// BenchmarkCloses returns SPY daily closes from start (YYYY-MM-DD) onward.
-func (a AlpacaSource) BenchmarkCloses(start string) ([]Point, error) {
-	bars, err := a.MarketData.DailyBars(benchmarkSymbol, start)
+// Closes returns daily closes of symbol (SPY, AGG) from start (YYYY-MM-DD) onward.
+func (a AlpacaSource) Closes(symbol, start string) ([]Point, error) {
+	bars, err := a.MarketData.DailyBars(symbol, start)
 	if err != nil {
 		return nil, err
 	}
@@ -57,6 +56,52 @@ func (a AlpacaSource) BenchmarkCloses(start string) ([]Point, error) {
 		out = append(out, Point{Date: b.Date, Value: b.Close})
 	}
 	return dedupe(out), nil
+}
+
+// Allocation splits account equity into the IPS sleeves (percent): cash
+// includes T-bill ETFs, bonds are the other curated bond ETFs.
+func (a AlpacaSource) Allocation() (Allocation, error) {
+	acctData, err := a.Broker.GetAccount()
+	if err != nil {
+		return Allocation{}, err
+	}
+	var acct struct {
+		Equity string `json:"equity"`
+		Cash   string `json:"cash"`
+	}
+	if err := json.Unmarshal(acctData, &acct); err != nil {
+		return Allocation{}, err
+	}
+	equity, _ := strconv.ParseFloat(acct.Equity, 64)
+	cash, _ := strconv.ParseFloat(acct.Cash, 64)
+	if equity <= 0 {
+		return Allocation{}, fmt.Errorf("account equity unavailable")
+	}
+	posData, err := a.Broker.GetPositions()
+	if err != nil {
+		return Allocation{}, err
+	}
+	var positions []struct {
+		Symbol      string `json:"symbol"`
+		MarketValue string `json:"market_value"`
+	}
+	if err := json.Unmarshal(posData, &positions); err != nil {
+		return Allocation{}, err
+	}
+	var eq, bonds float64
+	cashSleeve := max(cash, 0)
+	for _, p := range positions {
+		v, _ := strconv.ParseFloat(p.MarketValue, 64)
+		switch portfolio.Sleeve(p.Symbol) {
+		case portfolio.SleeveBonds:
+			bonds += v
+		case portfolio.SleeveCash:
+			cashSleeve += v
+		default:
+			eq += v
+		}
+	}
+	return Allocation{Equities: eq / equity * 100, Bonds: bonds / equity * 100, Cash: cashSleeve / equity * 100}, nil
 }
 
 // FilledOrders returns orders that filled on or after start (YYYY-MM-DD).

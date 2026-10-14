@@ -18,16 +18,22 @@ type orderRec struct {
 	symbol string
 	side   broker.Side
 	qty    int
+	kind   string  // "bracket", "oto" or "market"
+	stop   float64 // bracket / oto stop
 }
 
 type fakeOrders struct{ placed []orderRec }
 
-func (f *fakeOrders) PlaceBracketOrder(symbol string, qty int, side broker.Side, _, _ float64) error {
-	f.placed = append(f.placed, orderRec{symbol, side, qty})
+func (f *fakeOrders) PlaceBracketOrder(symbol string, qty int, side broker.Side, stop, _ float64) error {
+	f.placed = append(f.placed, orderRec{symbol, side, qty, "bracket", stop})
+	return nil
+}
+func (f *fakeOrders) PlaceOTOOrder(symbol string, qty int, side broker.Side, stop float64) error {
+	f.placed = append(f.placed, orderRec{symbol, side, qty, "oto", stop})
 	return nil
 }
 func (f *fakeOrders) PlaceMarketOrder(symbol string, qty int, side broker.Side) error {
-	f.placed = append(f.placed, orderRec{symbol, side, qty})
+	f.placed = append(f.placed, orderRec{symbol, side, qty, "market", 0})
 	return nil
 }
 func (f *fakeOrders) CancelOpenOrders(string) (int, error) { return 0, nil }
@@ -51,6 +57,15 @@ func (f *fakeOrders) qty(symbol string) int {
 	return 0
 }
 
+func (f *fakeOrders) order(symbol string) (orderRec, bool) {
+	for _, o := range f.placed {
+		if o.symbol == symbol {
+			return o, true
+		}
+	}
+	return orderRec{}, false
+}
+
 type fakeAcct struct{ a portfolio.Account }
 
 func (f fakeAcct) GetAccount() (*portfolio.Account, error) { a := f.a; return &a, nil }
@@ -65,7 +80,8 @@ const headline = "ACME wins $2B Pentagon contract for drone engines"
 
 func baseConfig() Config {
 	return Config{MaxPositionPct: 10, MaxOpenPositions: 8, MaxRiskPct: 1, MinBuyConviction: 8,
-		MinHoldDays: 3, ReentryCooldownDays: 3, MaxTradesPerDay: 2, MaxTradesPerWeek: 5}
+		MinHoldDays: 3, ReentryCooldownDays: 3, MaxTradesPerDay: 2, MaxTradesPerWeek: 5,
+		Bonds: portfolio.NewBondUniverse(nil)}
 }
 
 func newTestScheduler(cfg Config) (*Scheduler, *fakeOrders) {
@@ -74,13 +90,15 @@ func newTestScheduler(cfg Config) (*Scheduler, *fakeOrders) {
 		cfg: cfg, sectors: map[string]string{}, gate: newEvalGate(0), orders: o,
 		acct:          fakeAcct{portfolio.Account{Equity: 100_000, Cash: 100_000, BuyingPower: 100_000}},
 		lastDecisions: map[string]gemini.LastDecision{},
+		policy:        portfolio.DefaultPolicy(),
 	}, o
 }
 
 func newCycle(fills ...trades.Fill) *cycleState {
 	cs := &cycleState{
-		positions: map[string]*portfolio.Position{}, sectorValue: map[string]float64{}, warnedNoSec: map[string]bool{},
-		now: testNow, history: trades.NewSnapshot(fills, testDays, testNow),
+		positions: map[string]*portfolio.Position{}, dropReasons: map[string]int{}, sold: map[string]bool{},
+		account: &portfolio.Account{Equity: 100_000, Cash: 100_000, BuyingPower: 100_000},
+		now:     testNow, history: trades.NewSnapshot(fills, testDays, testNow),
 	}
 	cs.tradesDay, cs.tradesWeek = cs.history.DecisionCounts()
 	return cs
@@ -99,13 +117,15 @@ func ind() *indicators.Result { return &indicators.Result{Price: 100, ATR: 2.5} 
 
 func buy(sym string, conviction int, catalyst string) pendingDecision {
 	return pendingDecision{symbol: sym, ind: ind(), headlines: []string{headline, "Fed holds rates steady"},
-		decision: &gemini.Decision{Action: "BUY", Conviction: conviction, Catalyst: catalyst, Thesis: "t"}}
+		decision: &gemini.Decision{Action: "BUY", Conviction: conviction, Catalyst: catalyst, Thesis: "t",
+			Role: "growth", Rationale: "adds uncorrelated growth to the equity sleeve"}}
 }
 
 func sell(cs *cycleState, sym string) pendingDecision {
 	pos := &portfolio.Position{Symbol: sym, Qty: 25, AvgPrice: 90, MarketVal: 2500}
 	cs.positions[sym] = pos
-	return pendingDecision{symbol: sym, ind: ind(), position: pos, decision: &gemini.Decision{Action: "SELL", Conviction: 6, Thesis: "broken"}}
+	return pendingDecision{symbol: sym, ind: ind(), position: pos, decision: &gemini.Decision{Action: "SELL", Conviction: 6, Thesis: "broken",
+		Role: "core", Rationale: "thesis broken, cuts equity risk"}}
 }
 
 func TestCatalystMatches(t *testing.T) {

@@ -63,9 +63,11 @@ const (
 	calcTimeout = 120 * time.Second
 	scriptPath  = "python/indicators/calculate.py"
 
+	MacroTTL        = time.Hour        // yields, VIX, SPY/TLT trend
 	BarsTTL         = 10 * time.Minute // technicals
 	FundamentalsTTL = 24 * time.Hour   // beta, P/E, sector, name, average volume
-	failureTTL      = 2 * time.Minute  // negative cache, so one cycle does not hammer a failing source
+	macroFailureTTL = 10 * time.Minute
+	failureTTL      = 2 * time.Minute // negative cache, so one cycle does not hammer a failing source
 	logSnippet      = 300
 )
 
@@ -113,6 +115,42 @@ type Provider struct {
 	mu    sync.Mutex
 	bars  map[string]barsEntry
 	funds map[string]fundEntry
+	macro macroEntry
+}
+
+// MacroQuote is the latest close of a macro series and, for SPY and TLT, its
+// 200-day simple moving average. A nil field means the value is unavailable.
+type MacroQuote struct {
+	Close *float64 `json:"close"`
+	MA200 *float64 `json:"ma200"`
+}
+
+// Macro maps a Yahoo symbol (^IRX, ^FVX, ^TNX, ^TYX, ^VIX, SPY, TLT) to its quote.
+// Yields are in percent.
+type Macro map[string]MacroQuote
+
+// Value returns the latest close of sym.
+func (m Macro) Value(sym string) (float64, bool) {
+	q, ok := m[sym]
+	if !ok || q.Close == nil {
+		return 0, false
+	}
+	return *q.Close, true
+}
+
+// MA200 returns the 200-day moving average of sym.
+func (m Macro) MA200(sym string) (float64, bool) {
+	q, ok := m[sym]
+	if !ok || q.MA200 == nil {
+		return 0, false
+	}
+	return *q.MA200, true
+}
+
+type macroEntry struct {
+	m   Macro
+	err error
+	at  time.Time
 }
 
 func NewProvider(run Runner) *Provider {
@@ -127,6 +165,10 @@ var defaultProvider = NewProvider(nil)
 // Prefetch warms the caches for symbols in at most one technicals call and one
 // fundamentals call. Failures are cached briefly and surface from Calculate.
 func Prefetch(symbols []string) { defaultProvider.Prefetch(symbols) }
+
+// GetMacro returns cached macro data (refreshed hourly); on failure the error
+// is cached briefly so a Yahoo outage does not slow every cycle.
+func GetMacro() (Macro, error) { return defaultProvider.Macro() }
 
 // Calculate returns the indicators for symbol, from cache when fresh.
 func Calculate(symbol string) (*Result, error) { return defaultProvider.Calculate(symbol) }
@@ -287,6 +329,42 @@ func (p *Provider) Calculate(symbol string) (*Result, error) {
 		res.AvgVolume = 0 // unknown: IEX volume would understate liquidity
 	}
 	return &res, nil
+}
+
+// Macro returns the macro series, fetched through the Python worker and
+// cached for MacroTTL.
+func (p *Provider) Macro() (Macro, error) {
+	p.mu.Lock()
+	e := p.macro
+	p.mu.Unlock()
+	ttl := MacroTTL
+	if e.err != nil {
+		ttl = macroFailureTTL
+	}
+	if !e.at.IsZero() && p.now().Sub(e.at) < ttl {
+		return e.m, e.err
+	}
+
+	raw, err := p.call("macro", nil)
+	e = macroEntry{at: p.now()}
+	if err != nil {
+		e.err = err
+	} else {
+		e.m = Macro{}
+		for sym, msg := range raw {
+			var q MacroQuote
+			if json.Unmarshal(msg, &q) == nil {
+				e.m[sym] = q
+			}
+		}
+		if len(e.m) == 0 {
+			e.err = errors.New("no macro series returned")
+		}
+	}
+	p.mu.Lock()
+	p.macro = e
+	p.mu.Unlock()
+	return e.m, e.err
 }
 
 func snippet(b []byte) string {

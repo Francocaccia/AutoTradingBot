@@ -12,6 +12,7 @@ func TestCapQtyByRisk(t *testing.T) {
 	}{
 		// 2026-10-13: CIFR, 644 shares (7% of ~102k equity), stop 23% away.
 		{"CIFR-like wide stop is cut to ~400 shares", 644, 11.13, 8.56, 102_000, 1.0, 396, 23.0, 23.2},
+		{"CIFR at a flat 100k gives ~390, not 644", 644, 11.13, 8.56, 100_000, 1.0, 389, 23.0, 23.2},
 		{"tight stop is unchanged", 70, 100, 98, 100_000, 1.0, 70, 2.0, 2.0},
 		{"exactly at the cap is unchanged", 400, 100, 97.5, 100_000, 1.0, 400, 2.5, 2.5},
 		{"one share over the cap is trimmed", 401, 100, 97.5, 100_000, 1.0, 400, 2.5, 2.5},

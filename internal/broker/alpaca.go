@@ -119,6 +119,28 @@ func (c *AlpacaClient) PlaceBracketOrder(symbol string, qty int, side Side, stop
 	return err
 }
 
+type otoOrderRequest struct {
+	Symbol      string     `json:"symbol"`
+	Qty         int        `json:"qty"`
+	Side        Side       `json:"side"`
+	Type        string     `json:"type"`
+	TimeInForce string     `json:"time_in_force"`
+	OrderClass  string     `json:"order_class"`
+	StopLoss    bracketLeg `json:"stop_loss"`
+}
+
+// PlaceOTOOrder submits a market entry with an attached stop-loss leg only
+// (order_class: oto). Used for bond ETFs, which are reviewed on a schedule
+// instead of carrying a take-profit.
+func (c *AlpacaClient) PlaceOTOOrder(symbol string, qty int, side Side, stopLoss float64) error {
+	body := otoOrderRequest{
+		Symbol: symbol, Qty: qty, Side: side, Type: "market", TimeInForce: bracketTimeInForce,
+		OrderClass: "oto", StopLoss: bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
+	}
+	_, _, err := c.doRequest("POST", "/v2/orders", body)
+	return err
+}
+
 func (c *AlpacaClient) GetPositions() ([]byte, error) {
 	data, _, err := c.doRequest("GET", "/v2/positions", nil)
 	return data, err

@@ -161,6 +161,26 @@ func Bracket(price, atr, proposedTP float64) (Levels, error) {
 	return Levels{Stop: stop, Take: take, RewardRisk: rr}, nil
 }
 
+// StopBelow returns the stop-loss price atrMultiple x ATR below price, rounded
+// down to the cent, for positions that carry a stop but no take-profit (bond
+// ETFs). It fails when the stop would be non-positive or too tight.
+func StopBelow(price, atr, atrMultiple float64) (float64, error) {
+	if price <= 0 || atr <= 0 || atrMultiple <= 0 {
+		return 0, fmt.Errorf("need positive price (%.2f), ATR (%.4f) and multiple (%.1f)", price, atr, atrMultiple)
+	}
+	stop := math.Floor((price-atrMultiple*atr)*100) / 100
+	if stop <= 0 {
+		return 0, fmt.Errorf("ATR stop would be non-positive (price %.2f, ATR %.2f)", price, atr)
+	}
+	if price-stop < 0.01 {
+		return 0, fmt.Errorf("stop distance %.4f too small", price-stop)
+	}
+	return stop, nil
+}
+
+// BondStopATRMultiple is the wider stop used for bond ETFs.
+const BondStopATRMultiple = 3.0
+
 // Breakers evaluates the equity circuit breakers.
 //   - dayStop: equity is >= DailyLossLimitPct below the day's starting equity;
 //     no new positions until the next session.

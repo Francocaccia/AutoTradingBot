@@ -5,17 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"sort"
-	"strings"
 	"time"
 
+	"github.com/francocaccia/quantengine/internal/analysis"
 	"github.com/francocaccia/quantengine/internal/broker"
 	"github.com/francocaccia/quantengine/internal/gemini"
 	"github.com/francocaccia/quantengine/internal/indicators"
 	"github.com/francocaccia/quantengine/internal/market"
 	"github.com/francocaccia/quantengine/internal/news"
 	"github.com/francocaccia/quantengine/internal/portfolio"
+	"github.com/francocaccia/quantengine/internal/regime"
 	"github.com/francocaccia/quantengine/internal/risk"
 	"github.com/francocaccia/quantengine/internal/stats"
 	"github.com/francocaccia/quantengine/internal/trades"
@@ -27,11 +27,22 @@ const (
 	// minCatalystLen is the shortest quote accepted as a catalyst (or as a
 	// headline contained in one), so a stray word cannot "match" everything.
 	minCatalystLen = 12
+	// maxCorrelation is the average 60-day correlation to current holdings above
+	// which a BUY needs "replaces".
+	maxCorrelation = 0.8
+	// bondStepPct is the most a single bond-sleeve purchase may add, % of equity.
+	bondStepPct = 5.0
+	// candidateAddPct is the hypothetical purchase size shown in CANDIDATE FIT.
+	candidateAddPct = 5.0
+	// reviewBreachPts is how far outside a band a sleeve must be to trigger an
+	// extra review.
+	reviewBreachPts = 5.0
 )
 
 // orderPlacer is the part of the Alpaca client that places and cancels orders.
 type orderPlacer interface {
 	PlaceBracketOrder(symbol string, qty int, side broker.Side, stopLoss, takeProfit float64) error
+	PlaceOTOOrder(symbol string, qty int, side broker.Side, stopLoss float64) error
 	PlaceMarketOrder(symbol string, qty int, side broker.Side) error
 	CancelOpenOrders(symbol string) (int, error)
 }
@@ -47,7 +58,7 @@ type Config struct {
 	Gemini    *gemini.Client
 	Portfolio *portfolio.Portfolio
 	Universe  *universe.Universe
-	Stats     *stats.Service // in-memory equity peak for the drawdown halt
+	Stats     *stats.Service // equity peak for the drawdown halt, benchmark performance
 
 	MaxPositionPct   float64 // % of equity per position (hard cap)
 	MaxPositionUSD   float64 // optional absolute cap; <= 0 disables
@@ -67,6 +78,16 @@ type Config struct {
 	// History supplies filled orders and the trading calendar for the holding,
 	// cooldown and turnover guards. Without it BUYs are blocked.
 	History trades.Source
+
+	// Policy is the investment policy statement (zero value = DefaultPolicy).
+	Policy portfolio.Policy
+	// Bonds is the set of bond ETFs the bot may buy (nil = the whole curated
+	// table; portfolio.DisabledBondUniverse() = BOND_MODE=off).
+	Bonds *portfolio.BondUniverse
+	// Analyzer supplies volatility, beta and correlation; nil disables them.
+	Analyzer *analysis.Analyzer
+	// Macro fetches yields/VIX/trend data; nil uses indicators.GetMacro.
+	Macro func() (indicators.Macro, error)
 }
 
 const defaultCycleInterval = 15 * time.Minute
@@ -86,6 +107,15 @@ type Scheduler struct {
 	// lastDecisions is the model's previous answer per symbol, shown back to it
 	// so it can see when it is about to reverse itself. Best effort: in memory.
 	lastDecisions map[string]gemini.LastDecision
+
+	policy   portfolio.Policy // IPS; its targets move with the weekly review
+	lastPeak float64          // equity high-water mark seen by checkBuyBlock
+
+	lastReviewDay     string // session date of the last weekly review call
+	lastBandReviewDay string // session date of the last band-breach review call
+
+	// fetchBond loads indicators for a bond ETF proposed by the review.
+	fetchBond func(symbol string) (*indicators.Result, error)
 }
 
 func New(cfg Config) *Scheduler {
@@ -93,13 +123,25 @@ func New(cfg Config) *Scheduler {
 	if cfg.CycleInterval <= 0 {
 		cfg.CycleInterval = defaultCycleInterval
 	}
+	if cfg.Policy == (portfolio.Policy{}) {
+		cfg.Policy = portfolio.DefaultPolicy()
+	}
+	if cfg.Bonds == nil {
+		cfg.Bonds = portfolio.NewBondUniverse(nil)
+	}
+	if cfg.Macro == nil {
+		cfg.Macro = indicators.GetMacro
+	}
 	s := &Scheduler{cfg: cfg, ctx: ctx, cancel: cancel, sectors: map[string]string{}, gate: newEvalGate(cfg.EvalCooldown),
-		lastDecisions: map[string]gemini.LastDecision{}}
+		lastDecisions: map[string]gemini.LastDecision{}, policy: cfg.Policy}
 	if cfg.Broker != nil {
 		s.orders = cfg.Broker
 	}
 	if cfg.Portfolio != nil {
 		s.acct = cfg.Portfolio
+	}
+	if cfg.Universe != nil {
+		s.fetchBond = cfg.Universe.Validate
 	}
 	return s
 }
@@ -186,13 +228,17 @@ func (s *Scheduler) newsSymbols() []string {
 	return out
 }
 
+// pfContext is the portfolio-level view computed once per cycle.
+type pfContext struct {
+	in     analysis.Inputs
+	regime regime.Regime
+}
+
 // cycleState is the account/position snapshot shared by one decision cycle.
 type cycleState struct {
-	account     *portfolio.Account
-	positions   map[string]*portfolio.Position
-	sectorValue map[string]float64
-	buyBlock    string // non-empty: no new BUYs this cycle, with the reason
-	warnedNoSec map[string]bool
+	account   *portfolio.Account
+	positions map[string]*portfolio.Position
+	buyBlock  string // non-empty: no new BUYs this cycle, with the reason
 
 	stopGemini   bool // Gemini quota/budget hit: no more decisions this cycle
 	evaluated    int
@@ -209,9 +255,13 @@ type cycleState struct {
 	tradesDay  int // bot-decision orders filled today, plus placed this cycle
 	tradesWeek int // same over the rolling 5 trading days
 
-	pending []pendingDecision // collected during evaluation, executed afterwards
-	counts  decisionCounts
-	blocked int // decisions a guard refused to execute
+	pf *pfContext // nil only when the account snapshot is unavailable
+
+	pending     []pendingDecision // collected during evaluation, executed afterwards
+	counts      decisionCounts
+	blocked     int            // decisions a guard refused to execute
+	dropReasons map[string]int // guard key -> count
+	sold        map[string]bool
 }
 
 // decisionCounts tallies what the model answered this cycle.
@@ -220,12 +270,25 @@ type decisionCounts struct{ buy, sell, hold int }
 // pendingDecision is one model answer waiting for the end-of-cycle execution
 // pass, which orders trades by priority when the turnover caps bind.
 type pendingDecision struct {
-	symbol    string
-	ind       *indicators.Result
-	position  *portfolio.Position
-	decision  *gemini.Decision
-	sellOnly  bool
-	headlines []string // the headlines shown to the model, for catalyst verification
+	symbol        string
+	ind           *indicators.Result
+	position      *portfolio.Position
+	decision      *gemini.Decision
+	sellOnly      bool
+	headlines     []string // the headlines shown to the model, for catalyst verification
+	portfolioText string   // the PORTFOLIO block shown to the model, for macro-catalyst verification
+	corr          *analysis.Correlation
+	fromReview    bool // came from the weekly review (SELLs are exempt from MIN_HOLD_DAYS)
+}
+
+// drop records a decision a guard refused to execute.
+func (cs *cycleState) drop(symbol, action, key, why string) {
+	log.Printf("[%s] %s skipped: %s", symbol, action, why)
+	cs.blocked++
+	if cs.dropReasons == nil {
+		cs.dropReasons = map[string]int{}
+	}
+	cs.dropReasons[key]++
 }
 
 // headlinesFor returns the cached headlines that mention symbol (no
@@ -280,16 +343,13 @@ func (s *Scheduler) runMarketCycle() {
 	cs := &cycleState{
 		account:     acct,
 		positions:   map[string]*portfolio.Position{},
-		sectorValue: map[string]float64{},
-		warnedNoSec: map[string]bool{},
 		now:         sess.Now,
+		dropReasons: map[string]int{},
+		sold:        map[string]bool{},
 	}
 	for i := range posList {
 		p := posList[i]
 		cs.positions[p.Symbol] = &p
-		if sec := s.sectors[p.Symbol]; sec != "" {
-			cs.sectorValue[sec] += p.MarketVal
-		}
 	}
 	cs.buyBlock, cs.breaker = s.checkBuyBlock(sess, acct)
 	if cs.buyBlock != "" {
@@ -331,6 +391,11 @@ func (s *Scheduler) runMarketCycle() {
 		s.noteSector(items[i].Symbol, items[i].Ind)
 	}
 
+	// Portfolio-level context (weights, risk, regime) once per cycle, then the
+	// weekly review, whose actions join this cycle's decisions.
+	s.buildPortfolio(cs)
+	s.maybeReview(cs, sess)
+
 	for _, sym := range held {
 		if cs.stopGemini {
 			break
@@ -340,7 +405,8 @@ func (s *Scheduler) runMarketCycle() {
 			continue
 		}
 		// Outside the universe or failing the BUY filters (e.g. a low-volume
-		// ETF): still managed, SELL-only. The filters gate new positions only.
+		// ETF or a bond ETF): still managed, SELL-only. The filters gate new
+		// positions only; bond ETF purchases come from the weekly review.
 		ind, err := indicators.Calculate(sym)
 		if err != nil {
 			log.Printf("[%s] WARNING: indicators unavailable for held position: %v — existing bracket orders left untouched", sym, err)
@@ -369,16 +435,34 @@ func (s *Scheduler) runMarketCycle() {
 	}
 
 	s.executeDecisions(cs)
+	s.logCycleSummary(cs)
+}
 
-	// BUY/SELL/HOLD are the model's answers this cycle; skipped counts symbols
-	// not sent to Gemini plus answers a guard refused to execute. Orders
-	// actually placed show in the trades counters.
-	skipped := cs.skipCooldown + cs.skipNoSetup + cs.skipNoNews + cs.blocked
-	log.Printf("[Cycle] evaluated=%d BUY=%d SELL=%d HOLD=%d skipped=%d | trades today %d/%s, week %d/%s",
-		cs.evaluated, cs.counts.buy, cs.counts.sell, cs.counts.hold, skipped,
-		cs.tradesDay, capLabel(s.cfg.MaxTradesPerDay), cs.tradesWeek, capLabel(s.cfg.MaxTradesPerWeek))
+// logCycleSummary prints the one-line cycle summary. buys/sells/holds are the
+// model's answers; dropped are answers a guard refused, with reasons; skipped
+// are symbols never sent to Gemini.
+func (s *Scheduler) logCycleSummary(cs *cycleState) {
 	used, budget := s.cfg.Gemini.Usage()
-	log.Printf("[Gemini] calls today: %d/%d", used, budget)
+	skipped := cs.skipCooldown + cs.skipNoSetup + cs.skipNoNews
+	dropped := fmt.Sprintf("%d", cs.blocked)
+	if len(cs.dropReasons) > 0 {
+		keys := make([]string, 0, len(cs.dropReasons))
+		for k := range cs.dropReasons {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		dropped += " ("
+		for i, k := range keys {
+			if i > 0 {
+				dropped += ", "
+			}
+			dropped += fmt.Sprintf("%s x%d", k, cs.dropReasons[k])
+		}
+		dropped += ")"
+	}
+	log.Printf("[Cycle] evaluated=%d holds=%d buys=%d sells=%d dropped=%s not-evaluated=%d | trades today %d/%s, week %d/%s | Gemini calls today %d/%d",
+		cs.evaluated, cs.counts.hold, cs.counts.buy, cs.counts.sell, dropped, skipped,
+		cs.tradesDay, capLabel(s.cfg.MaxTradesPerDay), cs.tradesWeek, capLabel(s.cfg.MaxTradesPerWeek), used, budget)
 }
 
 // noHeadlineCandidate reports whether it is a screener candidate (not core)
@@ -402,6 +486,7 @@ func (s *Scheduler) checkBuyBlock(sess *market.Session, acct *portfolio.Account)
 	if s.cfg.Stats != nil {
 		peak = s.cfg.Stats.ObservePeak(acct.Equity)
 	}
+	s.lastPeak = peak
 	dayStop, ddHalt, dayPct, ddPct := risk.Breakers(acct.Equity, acct.LastEquity, peak)
 	if ddHalt {
 		reason := fmt.Sprintf("DRAWDOWN HALT: equity $%.2f is %.1f%% below peak $%.2f (limit %.0f%%)", acct.Equity, ddPct, peak, risk.MaxDrawdownPct)
@@ -426,6 +511,72 @@ func (s *Scheduler) checkBuyBlock(sess *market.Session, acct *portfolio.Account)
 func (s *Scheduler) noteSector(symbol string, ind *indicators.Result) {
 	if ind != nil && ind.Sector != "" {
 		s.sectors[symbol] = ind.Sector
+	}
+}
+
+// bookFrom turns the cycle's positions and an account snapshot into the
+// policy's view of the portfolio.
+func (s *Scheduler) bookFrom(cs *cycleState, acct *portfolio.Account) portfolio.Book {
+	b := portfolio.Book{Equity: acct.Equity, Cash: acct.Cash}
+	syms := make([]string, 0, len(cs.positions))
+	for sym := range cs.positions {
+		syms = append(syms, sym)
+	}
+	sort.Strings(syms)
+	for _, sym := range syms {
+		b.Holdings = append(b.Holdings, portfolio.Holding{Symbol: sym, Value: cs.positions[sym].MarketVal, Sector: s.sectors[sym]})
+	}
+	return b
+}
+
+// heldSymbols lists the symbols currently held, sorted.
+func heldSymbols(cs *cycleState) []string {
+	out := make([]string, 0, len(cs.positions))
+	for sym := range cs.positions {
+		out = append(out, sym)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// buildPortfolio computes the cycle's portfolio context: sleeve weights,
+// volatility and beta, drawdown, benchmark performance and the macro regime.
+// Every part degrades to "unavailable" instead of failing the cycle.
+func (s *Scheduler) buildPortfolio(cs *cycleState) {
+	if cs.account == nil {
+		return
+	}
+	book := s.bookFrom(cs, cs.account)
+	in := analysis.Inputs{Policy: s.policy, Book: book}
+
+	if macro, err := s.cfg.Macro(); err != nil {
+		log.Printf("[Regime] macro data unavailable: %v — regime unavailable, bond purchases limited to SGOV/BIL/SHY", err)
+		in.Regime = regime.Unavailable()
+	} else {
+		in.Regime = regime.Classify(macro)
+		if !in.Regime.Available {
+			log.Printf("[Regime] macro data incomplete — regime unavailable, bond purchases limited to SGOV/BIL/SHY")
+		}
+	}
+
+	if s.cfg.Analyzer != nil && book.Equity > 0 {
+		weights := map[string]float64{}
+		var invested float64
+		for _, h := range book.Holdings {
+			weights[h.Symbol] = h.Value
+			invested += h.Value
+		}
+		in.Vol, in.Beta, in.HaveRisk = s.cfg.Analyzer.PortfolioRisk(weights, invested/book.Equity)
+	}
+	if s.lastPeak > 0 && book.Equity > 0 {
+		in.DrawdownPct, in.HaveDD = max((s.lastPeak-book.Equity)/s.lastPeak*100, 0), true
+	}
+	if s.cfg.Stats != nil {
+		in.BotReturn, in.SPYReturn, in.Bench6040 = s.cfg.Stats.Performance()
+	}
+	cs.pf = &pfContext{in: in, regime: in.Regime}
+	if s.cfg.Debug {
+		log.Printf("[Portfolio] regime=%s", in.Regime.Label)
 	}
 }
 
@@ -457,10 +608,18 @@ func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly boo
 		log.Printf("[%s] evaluating: %s", symbol, why)
 	}
 
+	bondInfo, isBond := portfolio.BondInfoFor(symbol)
 	stop := 0.0
-	if l, err := risk.Bracket(ind.Price, ind.ATR, 0); err == nil {
+	if isBond {
+		if !bondInfo.CashLike {
+			if st, err := risk.StopBelow(ind.Price, ind.ATR, risk.BondStopATRMultiple); err == nil {
+				stop = st
+			}
+		}
+	} else if l, err := risk.Bracket(ind.Price, ind.ATR, 0); err == nil {
 		stop = l.Stop
 	}
+
 	articles := s.newsFor(symbol)
 	daysHeld := -1
 	if position != nil && cs.history != nil {
@@ -472,6 +631,25 @@ func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly boo
 	if l, ok := s.lastDecisions[symbol]; ok {
 		last = &l
 	}
+
+	// PORTFOLIO block: computed in Go. A flat symbol also gets its fit (average
+	// correlation to holdings, effect on sleeve and sector weights, IPS room).
+	var pfText string
+	var corr *analysis.Correlation
+	if cs.pf != nil {
+		var cand *analysis.Candidate
+		if position == nil && canBuy {
+			cand = &analysis.Candidate{Symbol: symbol, Sector: ind.Sector, AddPct: candidateAddPct}
+			if s.cfg.Analyzer != nil {
+				if c, ok := s.cfg.Analyzer.CorrelationTo(symbol, heldSymbols(cs)); ok {
+					corr, cand.Corr = &c, &c
+				}
+			}
+			cand.Room, cand.Bind = s.policy.Room(s.bookFrom(cs, cs.account), symbol, ind.Sector)
+		}
+		pfText = analysis.Render(cs.pf.in, cand)
+	}
+
 	prompt := gemini.BuildPrompt(gemini.PromptInput{
 		Symbol:     symbol,
 		Indicators: ind,
@@ -480,6 +658,9 @@ func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly boo
 		StopLoss:   stop,
 		DaysHeld:   daysHeld,
 		Last:       last,
+		Portfolio:  pfText,
+		BondETF:    isBond,
+		CashLike:   isBond && bondInfo.CashLike,
 	})
 	decision, err := s.cfg.Gemini.Decide(prompt)
 	if err != nil {
@@ -498,9 +679,9 @@ func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly boo
 	} else if decision.Conviction > 10 {
 		decision.Conviction = 10
 	}
-	log.Printf("[%s] %s conviction=%d | %s", symbol, decision.Action, decision.Conviction, decision.Thesis)
+	log.Printf("[%s] %s conviction=%d role=%s | %s", symbol, decision.Action, decision.Conviction, decision.Role, decision.Thesis)
 	if s.cfg.Debug {
-		log.Printf("[%s] reasoning: %s | catalyst: %s", symbol, decision.Reasoning, decision.Catalyst)
+		log.Printf("[%s] reasoning: %s | catalyst: %s | portfolio: %s", symbol, decision.Reasoning, decision.Catalyst, decision.Rationale)
 	}
 	if n := len(decision.SuggestedTickers); n > 0 {
 		if n > maxSuggestions {
@@ -519,246 +700,7 @@ func (s *Scheduler) evaluate(symbol string, ind *indicators.Result, sellOnly boo
 		shown = append(shown, a.Headline)
 	}
 	cs.pending = append(cs.pending, pendingDecision{
-		symbol: symbol, ind: ind, position: position, decision: decision, sellOnly: sellOnly, headlines: shown,
+		symbol: symbol, ind: ind, position: position, decision: decision, sellOnly: sellOnly,
+		headlines: shown, portfolioText: pfText, corr: corr,
 	})
-}
-
-// catalystMatches reports whether the model's catalyst quotes one of the
-// headlines it was shown (case-insensitive substring, either direction so a
-// "[Source] headline" quote also counts). "none" and empty never match.
-func catalystMatches(catalyst string, headlines []string) bool {
-	c := strings.ToLower(strings.Trim(strings.TrimSpace(catalyst), "\"'“”‘’ "))
-	if c == "" || c == "none" {
-		return false
-	}
-	for _, h := range headlines {
-		h = strings.ToLower(strings.TrimSpace(h))
-		if h == "" {
-			continue
-		}
-		if c == h {
-			return true
-		}
-		if len(c) >= minCatalystLen && strings.Contains(h, c) {
-			return true
-		}
-		if len(h) >= minCatalystLen && strings.Contains(c, h) {
-			return true
-		}
-	}
-	return false
-}
-
-// capBound reports whether a turnover cap blocks one more order.
-func (s *Scheduler) capBound(cs *cycleState) bool {
-	return (s.cfg.MaxTradesPerDay > 0 && cs.tradesDay >= s.cfg.MaxTradesPerDay) ||
-		(s.cfg.MaxTradesPerWeek > 0 && cs.tradesWeek >= s.cfg.MaxTradesPerWeek)
-}
-
-func (s *Scheduler) logCapSkip(symbol, action string, cs *cycleState) {
-	log.Printf("[%s] %s skipped: trade cap (today %d/%s, week %d/%s)", symbol, action,
-		cs.tradesDay, capLabel(s.cfg.MaxTradesPerDay), cs.tradesWeek, capLabel(s.cfg.MaxTradesPerWeek))
-	cs.blocked++
-}
-
-func (s *Scheduler) minBuyConviction() int {
-	if s.cfg.MinBuyConviction > 0 {
-		return s.cfg.MinBuyConviction
-	}
-	return risk.DefaultMinConviction
-}
-
-// buyEligibility returns why a BUY may not be executed ("" if it may). These
-// checks do not depend on how many orders were placed this cycle, so a BUY that
-// fails them never uses up a turnover slot.
-func (s *Scheduler) buyEligibility(p *pendingDecision, cs *cycleState) string {
-	switch {
-	case p.sellOnly:
-		return "symbol is outside the validated universe"
-	case cs.buyBlock != "":
-		return cs.buyBlock
-	case p.decision.Conviction < s.minBuyConviction():
-		return fmt.Sprintf("conviction %d below minimum %d", p.decision.Conviction, s.minBuyConviction())
-	case !catalystMatches(p.decision.Catalyst, p.headlines):
-		return fmt.Sprintf("no verified catalyst (%q is not one of the %d headlines shown)", p.decision.Catalyst, len(p.headlines))
-	case cs.history == nil:
-		return "order history unavailable, cannot check cooldown and turnover limits"
-	}
-	if s.cfg.ReentryCooldownDays > 0 {
-		if days, ok := cs.history.SinceLastSell(p.symbol); ok && days < s.cfg.ReentryCooldownDays {
-			return fmt.Sprintf("re-entry cooldown: sold %d trading day(s) ago, minimum %d", days, s.cfg.ReentryCooldownDays)
-		}
-	}
-	return ""
-}
-
-// executeDecisions acts on the cycle's collected answers. Risk-reducing SELLs
-// run first, then eligible BUYs by conviction (highest first), so when a
-// turnover cap binds the most valuable orders are the ones that go through.
-func (s *Scheduler) executeDecisions(cs *cycleState) {
-	var sells, buys []pendingDecision
-	for _, p := range cs.pending {
-		switch p.decision.Action {
-		case "BUY":
-			cs.counts.buy++
-			if why := s.buyEligibility(&p, cs); why != "" {
-				log.Printf("[%s] BUY skipped: %s", p.symbol, why)
-				cs.blocked++
-				continue
-			}
-			buys = append(buys, p)
-		case "SELL":
-			cs.counts.sell++
-			if p.position == nil {
-				log.Printf("[%s] SELL ignored: no long position to close (long-only)", p.symbol)
-				continue
-			}
-			sells = append(sells, p)
-		case "HOLD":
-			cs.counts.hold++
-		default:
-			log.Printf("[%s] unknown action %q — ignored", p.symbol, p.decision.Action)
-		}
-	}
-	sort.SliceStable(buys, func(i, j int) bool { return buys[i].decision.Conviction > buys[j].decision.Conviction })
-
-	for _, p := range sells {
-		s.execSell(p, cs)
-	}
-	for _, p := range buys {
-		s.execBuy(p, cs)
-	}
-}
-
-func (s *Scheduler) execSell(p pendingDecision, cs *cycleState) {
-	// Under a circuit breaker a SELL is a risk exit: the holding period and the
-	// turnover caps do not apply, and it is not counted against them.
-	if !cs.breaker {
-		if cs.history != nil && s.cfg.MinHoldDays > 0 {
-			if age, ok := cs.history.PositionAge(p.symbol); ok && age < s.cfg.MinHoldDays {
-				log.Printf("[%s] SELL skipped: position is %d trading day(s) old, minimum hold %d", p.symbol, age, s.cfg.MinHoldDays)
-				cs.blocked++
-				return
-			}
-		}
-		if cs.history != nil && s.capBound(cs) {
-			s.logCapSkip(p.symbol, "SELL", cs)
-			return
-		}
-	}
-	if s.closePosition(p.symbol, p.position, cs) && !cs.breaker {
-		cs.tradesDay++
-		cs.tradesWeek++
-	}
-}
-
-func (s *Scheduler) execBuy(p pendingDecision, cs *cycleState) {
-	if s.capBound(cs) {
-		s.logCapSkip(p.symbol, "BUY", cs)
-		return
-	}
-	if p.position == nil && len(cs.positions) >= s.cfg.MaxOpenPositions {
-		log.Printf("[%s] BUY skipped: %d open positions (max %d)", p.symbol, len(cs.positions), s.cfg.MaxOpenPositions)
-		cs.blocked++
-		return
-	}
-	if s.placeBuy(p.symbol, p.ind, cs.positions[p.symbol], p.decision, cs) {
-		cs.tradesDay++
-		cs.tradesWeek++
-	}
-}
-
-// placeBuy sizes and submits a bracket BUY. It reports whether an order was placed.
-func (s *Scheduler) placeBuy(symbol string, ind *indicators.Result, position *portfolio.Position, decision *gemini.Decision, cs *cycleState) bool {
-	levels, err := risk.Bracket(ind.Price, ind.ATR, decision.TakeProfit)
-	if err != nil {
-		log.Printf("[%s] BUY rejected: %v", symbol, err)
-		return false
-	}
-
-	// Fresh account so buying power reflects orders placed earlier this cycle.
-	acct, err := s.acct.GetAccount()
-	if err != nil {
-		log.Printf("[%s] BUY skipped: account fetch failed: %v", symbol, err)
-		return false
-	}
-	currentValue := 0.0
-	if position != nil {
-		currentValue = position.MarketVal
-	}
-	qty, reason := risk.Size(risk.SizeInput{
-		Equity:               acct.Equity,
-		Spendable:            acct.Spendable(),
-		Price:                ind.Price,
-		CurrentPositionValue: currentValue,
-		Conviction:           decision.Conviction,
-		MinConviction:        s.cfg.MinBuyConviction,
-		MaxPositionPct:       s.cfg.MaxPositionPct,
-		MaxPositionUSD:       s.cfg.MaxPositionUSD,
-	})
-	if qty <= 0 {
-		log.Printf("[%s] BUY skipped: %s", symbol, reason)
-		return false
-	}
-
-	if room, ok := risk.SectorRoom(ind.Sector, cs.sectorValue, acct.Equity); !ok {
-		if !cs.warnedNoSec[symbol] {
-			cs.warnedNoSec[symbol] = true
-			log.Printf("[%s] sector data unavailable — %.0f%% sector limit not applied", symbol, risk.MaxSectorPct)
-		}
-	} else if cost := float64(qty) * ind.Price; cost > room {
-		capped := int(math.Floor(room / ind.Price))
-		if capped < 1 {
-			log.Printf("[%s] BUY skipped: %s sector at %.0f%% limit", symbol, ind.Sector, risk.MaxSectorPct)
-			return false
-		}
-		log.Printf("[%s] BUY quantity cut from %d to %d by %.0f%% %s sector limit", symbol, qty, capped, risk.MaxSectorPct, ind.Sector)
-		qty = capped
-	}
-
-	// Per-trade risk: the loss if the stop is hit may not exceed MAX_RISK_PCT of equity.
-	if capped, stopPct := risk.CapQtyByRisk(qty, ind.Price, levels.Stop, acct.Equity, s.cfg.MaxRiskPct); capped < qty {
-		if capped < 1 {
-			log.Printf("[%s] BUY skipped: max-risk %.2f%% of equity allows less than 1 share (stop %.1f%% away)", symbol, s.cfg.MaxRiskPct, stopPct)
-			return false
-		}
-		log.Printf("[%s] BUY qty capped from %d to %d by max-risk (stop %.1f%% away)", symbol, qty, capped, stopPct)
-		qty = capped
-	}
-
-	if err := s.orders.PlaceBracketOrder(symbol, qty, broker.Buy, levels.Stop, levels.Take); err != nil {
-		log.Printf("[%s] BUY (bracket) failed: %v", symbol, err)
-		return false
-	}
-	log.Printf("[%s] BUY %d shares @ ~$%.2f (bracket stop=%.2f take=%.2f R:R=%.1f)", symbol, qty, ind.Price, levels.Stop, levels.Take, levels.RewardRisk)
-
-	cost := float64(qty) * ind.Price
-	if position == nil {
-		cs.positions[symbol] = &portfolio.Position{Symbol: symbol, Qty: qty, AvgPrice: ind.Price, MarketVal: cost}
-	} else {
-		position.MarketVal += cost
-		position.Qty += qty
-	}
-	if ind.Sector != "" {
-		cs.sectorValue[ind.Sector] += cost
-	}
-	return true
-}
-
-// closePosition exits a whole long position. Open bracket legs reserve the
-// shares, so they are cancelled first. It reports whether the order was placed.
-func (s *Scheduler) closePosition(symbol string, pos *portfolio.Position, cs *cycleState) bool {
-	if n, err := s.orders.CancelOpenOrders(symbol); err != nil {
-		log.Printf("[%s] cancelling open orders failed (%d cancelled): %v", symbol, n, err)
-	}
-	if err := s.orders.PlaceMarketOrder(symbol, pos.Qty, broker.Sell); err != nil {
-		log.Printf("[%s] SELL failed: %v", symbol, err)
-		return false
-	}
-	log.Printf("[%s] SELL %d shares (closing long)", symbol, pos.Qty)
-	if sec := s.sectors[symbol]; sec != "" {
-		cs.sectorValue[sec] -= pos.MarketVal
-	}
-	delete(cs.positions, symbol)
-	return true
 }

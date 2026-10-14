@@ -25,13 +25,16 @@ class RelVolumeTest(unittest.TestCase):
         df = frame([500] * 10 + [1000] * 60 + [2000] + [1])
         self.assertEqual(calculate.rel_volume(df), 2.0)
 
-    def test_short_history_uses_what_exists(self):
-        df = frame([100, 100, 200, 7])
-        self.assertEqual(calculate.rel_volume(df), 2.0)
+    def test_fewer_than_60_baseline_sessions_is_null(self):
+        # 59 baseline sessions + last completed + partial = 61 bars: not enough.
+        self.assertIsNone(calculate.rel_volume(frame([100] * 59 + [200, 7])))
+        self.assertIsNone(calculate.rel_volume(frame([100, 100, 200, 7])))
 
-    def test_degenerate_inputs(self):
-        self.assertEqual(calculate.rel_volume(frame([5, 5])), 0.0)
-        self.assertEqual(calculate.rel_volume(frame([0, 0, 100, 3])), 0.0)
+    def test_exactly_60_baseline_sessions_is_enough(self):
+        self.assertEqual(calculate.rel_volume(frame([100] * 60 + [150, 7])), 1.5)
+
+    def test_zero_baseline_is_null(self):
+        self.assertIsNone(calculate.rel_volume(frame([0] * 60 + [100, 3])))
 
     def test_avg_volume_unchanged(self):
         df = frame([1000] * 60 + [850] + [5])

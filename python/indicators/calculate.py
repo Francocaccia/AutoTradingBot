@@ -3,6 +3,7 @@
 Usage:
     calculate.py bars SYM [SYM ...]          technicals for all symbols, one batched fetch
     calculate.py fundamentals SYM [SYM ...]  beta, P/E, sector, name, average volume (yfinance)
+    calculate.py macro                       yields, VIX, SPY/TLT vs 200d MA (yfinance)
 
 Contract with the Go caller: stdout carries exactly one JSON object and nothing
 else ({"SYM": {...} | {"error": "..."}} or a top-level {"error": "..."});
@@ -123,16 +124,16 @@ def rel_volume(df, sessions=60):
     The final bar is the in-progress session and is excluded from both sides, and
     both sides come from the same bars, so the ratio is unit-consistent even on
     the IEX feed (whose absolute volume is a small slice of consolidated volume).
-    Returns 0.0 when there is not enough history or the baseline is zero.
+    Returns None (JSON null) unless a full `sessions`-long baseline exists and
+    is non-zero.
     """
     vol = df["Volume"]
-    if len(vol) < 3:
-        return 0.0
-    last = safe(vol.iloc[-2])
+    if len(vol) < sessions + 2:
+        return None
     base = safe(vol.iloc[-(sessions + 2):-2].mean())
     if base <= 0:
-        return 0.0
-    return round(last / base, 2)
+        return None
+    return round(safe(vol.iloc[-2]) / base, 2)
 
 
 def rsi(close, length=14):
@@ -287,18 +288,53 @@ def cmd_fundamentals(symbols):
     return out
 
 
+MACRO_YIELDS = ("^IRX", "^FVX", "^TNX", "^TYX")
+
+
+def last_close(series):
+    series = series.dropna()
+    return round(float(series.iloc[-1]), 4) if len(series) else None
+
+
+def cmd_macro():
+    """Latest yields (percent), VIX, and SPY/TLT last close with their 200d simple MA."""
+    import yfinance as yf
+
+    syms = list(MACRO_YIELDS) + ["^VIX", "SPY", "TLT"]
+
+    def fetch():
+        return yf.download(syms, period="1y", interval="1d", group_by="ticker",
+                           threads=False, progress=False, auto_adjust=False)
+
+    raw = with_retry(fetch)
+    out = {}
+    for sym in syms:
+        try:
+            close = raw[sym]["Close"].dropna()
+        except KeyError:
+            continue
+        entry = {"close": last_close(close)}
+        if sym in ("SPY", "TLT"):
+            entry["ma200"] = round(float(close.iloc[-200:].mean()), 4) if len(close) >= 200 else None
+        out[sym] = entry
+    return out
+
+
 def main():
     real_stdout = sys.stdout
     sys.stdout = sys.stderr  # stray prints from libraries must not corrupt the JSON
     try:
-        if len(sys.argv) < 3 or sys.argv[1] not in ("bars", "fundamentals"):
-            raise ValueError("usage: calculate.py bars|fundamentals SYMBOL [SYMBOL ...]")
-        symbols = []
-        for a in sys.argv[2:]:
-            a = a.upper()
-            if a not in symbols:
-                symbols.append(a)
-        result = cmd_bars(symbols) if sys.argv[1] == "bars" else cmd_fundamentals(symbols)
+        if len(sys.argv) >= 2 and sys.argv[1] == "macro":
+            result = cmd_macro()
+        else:
+            if len(sys.argv) < 3 or sys.argv[1] not in ("bars", "fundamentals"):
+                raise ValueError("usage: calculate.py bars|fundamentals SYMBOL [SYMBOL ...] | macro")
+            symbols = []
+            for a in sys.argv[2:]:
+                a = a.upper()
+                if a not in symbols:
+                    symbols.append(a)
+            result = cmd_bars(symbols) if sys.argv[1] == "bars" else cmd_fundamentals(symbols)
     except BaseException as exc:  # noqa: BLE001
         result = {"error": f"{type(exc).__name__}: {exc}"}
     sys.stdout = real_stdout

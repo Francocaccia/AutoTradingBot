@@ -87,6 +87,9 @@ type Universe struct {
 	// Prefetch optionally warms Fetch's cache for several symbols at once
 	// (one batched market-data call per cycle). May be nil.
 	Prefetch func(symbols []string)
+	// Exempt lists symbols (the curated bond ETFs) that skip the price and
+	// average-volume filters. The leveraged/inverse check still applies. May be nil.
+	Exempt func(symbol string) bool
 	// Held lists symbols currently held; a candidate whose other share class
 	// is held is skipped. Set by the scheduler each cycle.
 	Held []string
@@ -280,7 +283,11 @@ func (u *Universe) validateMarket(symbol string, asset *Asset) (*indicators.Resu
 	if err != nil {
 		return nil, fmt.Errorf("market data fetch failed: %w", err)
 	}
-	if err := CheckMarket(asset, ind); err != nil {
+	check := CheckMarket
+	if u.Exempt != nil && u.Exempt(symbol) {
+		check = CheckMarketExempt
+	}
+	if err := check(asset, ind); err != nil {
 		return nil, err
 	}
 	return ind, nil
@@ -326,6 +333,25 @@ func CheckMarket(a *Asset, ind *indicators.Result) error {
 	}
 	if ind.AvgVolume < MinAvgVolume {
 		return fmt.Errorf("avg daily volume %.0f below %.0f", ind.AvgVolume, MinAvgVolume)
+	}
+	isETF := ind.QuoteType != "" && !strings.EqualFold(ind.QuoteType, "EQUITY")
+	for _, name := range []string{ind.Name, nameOf(a)} {
+		if IsLeveragedOrInverse(name, isETF) {
+			return fmt.Errorf("leveraged/inverse product %q", name)
+		}
+	}
+	return nil
+}
+
+// CheckMarketExempt is CheckMarket without the price and liquidity filters,
+// for the curated bond ETFs (T-bill ETFs trade near $100 and some trade
+// lightly). Market data must exist and leveraged/inverse products still fail.
+func CheckMarketExempt(a *Asset, ind *indicators.Result) error {
+	if ind == nil {
+		return errors.New("no market data")
+	}
+	if ind.Price <= 0 {
+		return errors.New("no price")
 	}
 	isETF := ind.QuoteType != "" && !strings.EqualFold(ind.QuoteType, "EQUITY")
 	for _, name := range []string{ind.Name, nameOf(a)} {
