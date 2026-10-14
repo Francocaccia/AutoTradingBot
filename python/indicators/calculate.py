@@ -118,6 +118,30 @@ def avg_volume(df, sessions=60):
     return round(safe(hist.mean()), 0)
 
 
+def avg_dollar_volume(df, sessions=60):
+    """Mean of close*volume over the last `sessions` completed sessions (the
+    final bar is the in-progress session and is excluded). On the IEX feed the
+    volume is a slice of consolidated volume, so this understates liquidity."""
+    hist = (df["Close"] * df["Volume"]).iloc[-(sessions + 1):-1]
+    return round(safe(hist.mean()), 0)
+
+
+def day_change_pct(df):
+    """Last bar's close vs the previous close, in percent (0 when unknown)."""
+    close = df["Close"]
+    if len(close) < 2 or safe(close.iloc[-2]) <= 0:
+        return 0.0
+    return round((safe(close.iloc[-1]) / safe(close.iloc[-2]) - 1) * 100, 2)
+
+
+def range_pct(df):
+    """Last bar's (high - low) / close, in percent (0 when unknown)."""
+    close = safe(df["Close"].iloc[-1])
+    if close <= 0:
+        return 0.0
+    return round((safe(df["High"].iloc[-1]) - safe(df["Low"].iloc[-1])) / close * 100, 2)
+
+
 def rel_volume(df, sessions=60):
     """Last COMPLETED session's volume / mean of the `sessions` completed sessions before it.
 
@@ -177,6 +201,9 @@ def technicals(symbol, df, source):
         "rsi":        rsi(df["Close"]),
         "atr":        atr(df),
         "avg_volume": avg_volume(df),
+        "avg_dollar_volume": avg_dollar_volume(df),
+        "day_change_pct": day_change_pct(df),
+        "range_pct":  range_pct(df),
         "rel_volume": rel_volume(df),
         "ichimoku":   ichimoku(df),
         "macd":       macd(df["Close"]),
@@ -275,10 +302,16 @@ def cmd_fundamentals(symbols):
             time.sleep(random.uniform(0.3, 1.0))  # jitter between per-ticker requests
         try:
             info = with_retry(lambda: yf.Ticker(sym).info) or {}
+            if not info.get("averageVolume") and not info.get("quoteType"):
+                # Throttled Yahoo often answers with an empty info dict instead of an
+                # error. Report it as a failure so the Go caller retries instead of
+                # caching zeros for hours.
+                raise ValueError("yahoo returned no data")
             out[sym] = {
                 "beta":       round(float(info.get("beta") or 0), 4),
                 "pe_ratio":   round(float(info.get("trailingPE") or 0), 4),
                 "avg_volume": float(info.get("averageVolume") or 0),
+                "market_cap": float(info.get("marketCap") or 0),
                 "sector":     info.get("sector") or "",
                 "name":       info.get("longName") or info.get("shortName") or "",
                 "quote_type": info.get("quoteType") or "",

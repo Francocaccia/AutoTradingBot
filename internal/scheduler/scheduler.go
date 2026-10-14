@@ -337,15 +337,18 @@ func (s *Scheduler) headlinesFor(symbol string) []string {
 func (s *Scheduler) runMarketCycle() {
 	if s.paused {
 		log.Println("[Scheduler] Paused — skipping cycle")
+		s.logEarlySkip("scheduler paused")
 		return
 	}
 	sess, err := market.GetSession(s.cfg.Broker)
 	if err != nil {
 		log.Printf("[Market] Session check failed: %v — skipping cycle", err)
+		s.logEarlySkip("market session unknown")
 		return
 	}
 	if !sess.IsOpen {
 		log.Println("[Market] Closed — skipping cycle")
+		s.logEarlySkip("market closed")
 		return
 	}
 	log.Println("[Market] Open — running decision cycle")
@@ -361,6 +364,7 @@ func (s *Scheduler) runMarketCycle() {
 			label = "models"
 		}
 		log.Printf("[Gemini] %s: paused (%s; calls today %s, counted by this process) — no decisions this cycle; bracket orders stay active", label, why, s.cfg.Gemini.UsageSummary())
+		s.logEarlySkip("Gemini paused (" + why + ")")
 		return
 	}
 

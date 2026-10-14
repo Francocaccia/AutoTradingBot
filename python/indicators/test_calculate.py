@@ -41,5 +41,22 @@ class RelVolumeTest(unittest.TestCase):
         self.assertEqual(calculate.avg_volume(df), round((1000 * 59 + 850) / 60, 0))
 
 
+class CandidateMetricsTest(unittest.TestCase):
+    def test_day_change_is_last_bar_vs_previous_close(self):
+        df = pd.DataFrame({"Close": [26.0, 12.5]})
+        self.assertEqual(calculate.day_change_pct(df), -51.92)
+
+    def test_day_change_unknown_with_one_bar(self):
+        self.assertEqual(calculate.day_change_pct(pd.DataFrame({"Close": [10.0]})), 0.0)
+
+    def test_range_pct_uses_last_bar(self):
+        df = pd.DataFrame({"Close": [10.0, 10.0], "High": [11.0, 11.0], "Low": [9.0, 9.5]})
+        self.assertEqual(calculate.range_pct(df), 15.0)
+
+    def test_avg_dollar_volume_excludes_partial_bar(self):
+        df = pd.DataFrame({"Close": [10.0] * 60 + [99.0], "Volume": [1000] * 60 + [1]})
+        self.assertEqual(calculate.avg_dollar_volume(df), 10000.0)
+
+
 if __name__ == "__main__":
     unittest.main()

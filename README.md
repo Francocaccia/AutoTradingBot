@@ -198,7 +198,9 @@ The core watchlist (SPY, QQQ, AAPL, MSFT, NVDA, AMZN, GOOG) is always evaluated.
 
 - exists on Alpaca (`GET /v2/assets/{symbol}`), status `active`, tradable, class `us_equity`
 - exchange is NYSE, NASDAQ or ARCA (no OTC)
-- price >= $5 and average daily volume >= 1M shares (from the yfinance data). The core watchlist and the bond/ETF sleeve are **exempt from the volume filter**: if the volume is unavailable (Yahoo failing from a cloud IP) a `WARN` is logged and the symbol is kept. Screener candidates still fail closed (rejected when volume is unavailable). Yahoo fundamentals are retried with backoff (2s, 5s), and the last good average volume per symbol is kept for 24 hours as a fallback
+- price >= $5 and average daily volume >= 1M shares (from the yfinance data). The core watchlist and the bond/ETF sleeve are **exempt from the volume filter**: if the volume is unavailable (Yahoo failing from a cloud IP) a `WARN` is logged and the symbol is kept. Screener candidates still fail closed (rejected when volume is unavailable). Yahoo fundamentals are retried with jittered backoff (about 2s, 5s; an empty Yahoo reply counts as a failure and is retried), and the last good average volume per symbol is kept for 24 hours as a fallback (logged whenever it is used)
+- **liquidity fallback (candidates only, never core):** if Yahoo's average volume is unavailable, the average daily **dollar** volume over 60 sessions of Alpaca daily bars is used instead and must be >= `LIQUIDITY_MIN_DOLLAR_VOL` (default `20000000`). The accepted-candidate log line says which source was used. Alpaca's free IEX feed carries only a slice of consolidated volume, so this figure understates real liquidity and the fallback is conservative. If both sources fail the candidate is rejected
+- **candidate quality (screener candidates only; core and bond ETFs are exempt):** rejected when the last bar's close is more than `CANDIDATE_MAX_DAY_MOVE_PCT` (default `20`) away from the previous close, its intraday range (high-low)/close is above `CANDIDATE_MAX_RANGE_PCT` (default `15`), ATR(14)/price is above `CANDIDATE_MAX_ATR_PCT` (default `7`), or market cap is below `CANDIDATE_MIN_MARKET_CAP_USD` (default `2e9`). Market cap comes from the Yahoo fundamentals already fetched; when it is unavailable that one check is skipped. Each rejection is logged with the measured value; `0` disables a check
 - not a leveraged or inverse ETF by name
 - market data fetch succeeded (otherwise the symbol is skipped and logged)
 
@@ -231,6 +233,8 @@ All limits are enforced in code and apply to BUYs; SELL and the server-side stop
 - **Drawdown halt:** if equity is 10% or more below its peak, BUYs halt and a loud `[RISK]` line is logged every cycle until drawdown recovers. The peak is held in memory, seeded from Alpaca's equity history since `TRACK_START_DATE` (so it survives restarts but ignores earlier highs).
 - **Entry buffer:** no new BUY in the first or last 10 minutes of the session (half days respected via Alpaca's calendar).
 - **Long-only:** SELL is only honored when a long position exists, and it closes the whole position after cancelling its open bracket legs.
+
+**Review visibility.** Every cycle in which the weekly or band-breach review does not run logs one `[Review] not run: <reason> | cash X% of equity, band lo-hi%` line (not due, before 10:00 ET, already ran today, Gemini paused or out of budget, trade cap reached, market closed, scheduler paused). A review that runs logs its outcome as before.
 
 ## Deployment
 

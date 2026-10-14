@@ -112,6 +112,17 @@ func TestBadRequestAndForbiddenAlsoDropTheModel(t *testing.T) {
 	}
 }
 
+func TestBadAPIKeyDoesNotDropModels(t *testing.T) {
+	body := `{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}`
+	c, ms := newModelServer(t, map[string][]step{"primary": {{400, body}}, "fallback": {{400, body}}})
+	if _, err := c.Decide("p"); err == nil || errors.Is(err, ErrNoModel) {
+		t.Fatalf("a bad key is a plain error, not a missing model: %v", err)
+	}
+	if len(ms.calls) != 1 || len(c.Chain()) != 2 {
+		t.Errorf("calls %v chain %v: a bad key must neither fall through nor drop models", ms.calls, c.Chain())
+	}
+}
+
 func TestAllModelsUnavailableIsErrNoModel(t *testing.T) {
 	c, ms := newModelServer(t, map[string][]step{}) // every model answers 404
 	_, err := c.Decide("p")

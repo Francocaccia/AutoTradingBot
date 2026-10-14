@@ -800,6 +800,11 @@ func (c *Client) callOnce(model, prompt string, schema any) (string, error) {
 			err:    fmt.Errorf("gemini HTTP %d on %s: %s", resp.StatusCode, model, errorSummary(body)),
 		}
 	case http.StatusNotFound, http.StatusBadRequest, http.StatusForbidden:
+		if isAPIKeyProblem(body) {
+			// A bad or revoked key is not the model's fault: do not drop it, and
+			// do not retry; the error surfaces as it is.
+			return "", fmt.Errorf("gemini HTTP %d on %s: %s", resp.StatusCode, model, errorSummary(body))
+		}
 		// The model is gone, retired for this key, or rejects the request: never
 		// retried, never counted, and not called again by this process.
 		why := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, errorSummary(body))
@@ -823,6 +828,17 @@ func (c *Client) callOnce(model, prompt string, schema any) (string, error) {
 	}
 
 	return apiResp.Candidates[0].Content.Parts[0].Text, nil
+}
+
+// isAPIKeyProblem reports whether an error body complains about the API key
+// itself (Google answers an invalid key with HTTP 400, an unusable one with 403).
+func isAPIKeyProblem(body []byte) bool {
+	var e apiErrorBody
+	if json.Unmarshal(body, &e) != nil {
+		return false
+	}
+	m := strings.ToLower(e.Error.Message)
+	return strings.Contains(m, "api key") || strings.Contains(m, "api_key")
 }
 
 // extractJSON strips code fences and surrounding prose from a model reply.

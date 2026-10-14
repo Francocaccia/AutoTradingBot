@@ -20,6 +20,9 @@ type fakeLLM struct {
 	singleCalls  []string
 	singleErr    error
 	remaining    int
+	reviews      int
+	review       *gemini.Review
+	reviewErr    error
 }
 
 func (f *fakeLLM) DecideBatch(prompt string, prio gemini.Priority) ([]gemini.BatchResult, error) {
@@ -37,6 +40,11 @@ func (f *fakeLLM) DecideAt(prompt string, prio gemini.Priority) (*gemini.Decisio
 }
 
 func (f *fakeLLM) Remaining() int { return f.remaining }
+
+func (f *fakeLLM) Review(string) (*gemini.Review, error) {
+	f.reviews++
+	return f.review, f.reviewErr
+}
 
 func entry(sym string, prio gemini.Priority) *batchEntry {
 	return &batchEntry{symbol: sym, prio: prio, ind: ind(), canBuy: true, in: evalInput{Symbol: sym}}

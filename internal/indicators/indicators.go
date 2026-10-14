@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"os/exec"
 	"sync"
 	"time"
@@ -22,11 +23,22 @@ type Result struct {
 
 	ATR       float64 `json:"atr"`        // ATR(14), in dollars
 	AvgVolume float64 `json:"avg_volume"` // mean daily volume over ~60 completed sessions (consolidated via Yahoo for IEX bars); liquidity filter only
-	RelVolume float64 `json:"rel_volume"` // last completed session volume / mean of the 60 sessions before it, same bars on both sides; 0 = unknown
-	Sector    string  `json:"sector"`     // empty when unavailable (e.g. ETFs)
-	Name      string  `json:"name"`
-	QuoteType string  `json:"quote_type"` // EQUITY, ETF, ...
-	Source    string  `json:"source"`     // alpaca-iex or yfinance (bars)
+	// AvgDollarVolume is the mean of close*volume over ~60 completed sessions
+	// from the same bars as the technicals (Alpaca IEX, a slice of consolidated
+	// volume, so it understates liquidity). The liquidity fallback when Yahoo's
+	// average volume is unavailable. 0 = unknown.
+	AvgDollarVolume float64 `json:"avg_dollar_volume"`
+	DayChangePct    float64 `json:"day_change_pct"` // last bar's close vs the previous close, %; 0 = unknown
+	RangePct        float64 `json:"range_pct"`      // last bar's (high-low)/close, %; 0 = unknown
+	MarketCap       float64 `json:"-"`              // USD, from Yahoo fundamentals; 0 = unknown
+	// VolumeSource says where AvgVolume came from: "yahoo", "cache" (last good
+	// Yahoo value, up to 24h old), "bars" (consolidated bars) or "" (unknown).
+	VolumeSource string  `json:"-"`
+	RelVolume    float64 `json:"rel_volume"` // last completed session volume / mean of the 60 sessions before it, same bars on both sides; 0 = unknown
+	Sector       string  `json:"sector"`     // empty when unavailable (e.g. ETFs)
+	Name         string  `json:"name"`
+	QuoteType    string  `json:"quote_type"` // EQUITY, ETF, ...
+	Source       string  `json:"source"`     // alpaca-iex or yfinance (bars)
 
 	Ichimoku   IchimokuResult   `json:"ichimoku"`
 	MACD       MACDResult       `json:"macd"`
@@ -101,6 +113,7 @@ type fundamentals struct {
 	Beta      float64 `json:"beta"`
 	PE        float64 `json:"pe_ratio"`
 	AvgVolume float64 `json:"avg_volume"`
+	MarketCap float64 `json:"market_cap"`
 	Sector    string  `json:"sector"`
 	Name      string  `json:"name"`
 	QuoteType string  `json:"quote_type"`
@@ -113,6 +126,9 @@ type Provider struct {
 	run   Runner
 	now   func() time.Time
 	sleep func(time.Duration) // backoff between fundamentals retries; overridden in tests
+	// jitter returns the actual wait for a base backoff delay (base plus up to
+	// 50% random, so retries from several bursts do not line up); tests replace it.
+	jitter func(time.Duration) time.Duration
 
 	mu      sync.Mutex
 	bars    map[string]barsEntry
@@ -166,11 +182,16 @@ type macroEntry struct {
 	at  time.Time
 }
 
+// addJitter returns d plus up to 50% of d.
+func addJitter(d time.Duration) time.Duration {
+	return d + time.Duration(rand.Int63n(int64(d)/2+1))
+}
+
 func NewProvider(run Runner) *Provider {
 	if run == nil {
 		run = execRunner
 	}
-	return &Provider{run: run, now: time.Now, sleep: time.Sleep, bars: map[string]barsEntry{}, funds: map[string]fundEntry{}, lastVol: map[string]volEntry{}}
+	return &Provider{run: run, now: time.Now, sleep: time.Sleep, jitter: addJitter, bars: map[string]barsEntry{}, funds: map[string]fundEntry{}, lastVol: map[string]volEntry{}}
 }
 
 var defaultProvider = NewProvider(nil)
@@ -329,7 +350,7 @@ func (p *Provider) fetchFund(symbols []string) {
 		if len(failed) == 0 || attempt >= len(fundRetryDelays) {
 			break
 		}
-		delay := fundRetryDelays[attempt]
+		delay := p.jitter(fundRetryDelays[attempt])
 		log.Printf("[Indicators] fundamentals failed for %d symbol(s) (%v); retry %d/%d in %s", len(failed), lastErr, attempt+1, len(fundRetryDelays), delay)
 		p.sleep(delay)
 		remaining = failed
@@ -359,19 +380,27 @@ func (p *Provider) Calculate(symbol string) (*Result, error) {
 	}
 	res := *b.res
 	if f := p.funds[symbol].f; f != nil {
-		res.Beta, res.PE, res.Sector, res.Name, res.QuoteType = f.Beta, f.PE, f.Sector, f.Name, f.QuoteType
+		res.Beta, res.PE, res.Sector, res.Name, res.QuoteType, res.MarketCap = f.Beta, f.PE, f.Sector, f.Name, f.QuoteType, f.MarketCap
 		// IEX bar volume is a small slice of consolidated volume, so liquidity
 		// comes from Yahoo's average volume whenever the bars are IEX.
 		if res.Source != "yfinance" {
 			res.AvgVolume = f.AvgVolume
+			if res.AvgVolume > 0 {
+				res.VolumeSource = "yahoo"
+			}
 		}
 	} else if res.Source != "yfinance" {
 		res.AvgVolume = 0 // unknown: IEX volume would understate liquidity
+	}
+	if res.Source == "yfinance" && res.AvgVolume > 0 {
+		res.VolumeSource = "bars"
 	}
 	if res.Source != "yfinance" && res.AvgVolume <= 0 {
 		// Yahoo failed or returned nothing: fall back to the last good value (24h).
 		if v, ok := p.lastVol[symbol]; ok && p.now().Sub(v.at) < volumeTTL {
 			res.AvgVolume = v.v
+			res.VolumeSource = "cache"
+			log.Printf("[Indicators] %s: Yahoo average volume unavailable, using the cached value from %s ago (%.1fM)", symbol, p.now().Sub(v.at).Round(time.Minute), v.v/1e6)
 		}
 	}
 	return &res, nil

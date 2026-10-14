@@ -21,6 +21,7 @@ import (
 type decider interface {
 	DecideBatch(prompt string, prio gemini.Priority) ([]gemini.BatchResult, error)
 	DecideAt(prompt string, prio gemini.Priority) (*gemini.Decision, error)
+	Review(prompt string) (*gemini.Review, error)
 	Remaining() int
 }
 

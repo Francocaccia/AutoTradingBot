@@ -69,6 +69,13 @@ func main() {
 	maxCandidates := envInt("UNIVERSE_MAX_CANDIDATES", defaultMaxCandidates)
 	uni := universe.New(coreWatchlist, maxCandidates, universe.BrokerAssets{Broker: alpacaClient}, dataClient, indicators.Calculate)
 	uni.Prefetch = indicators.Prefetch
+	uni.Limits = universe.Limits{
+		MaxDayMovePct: envFloat("CANDIDATE_MAX_DAY_MOVE_PCT", 20),
+		MaxRangePct:   envFloat("CANDIDATE_MAX_RANGE_PCT", 15),
+		MaxATRPct:     envFloat("CANDIDATE_MAX_ATR_PCT", 7),
+		MinMarketCap:  envFloat("CANDIDATE_MIN_MARKET_CAP_USD", 2e9),
+		MinDollarVol:  envFloat("LIQUIDITY_MIN_DOLLAR_VOL", 20_000_000),
+	}
 	// Curated bond ETFs skip the single-stock price/volume filters.
 	uni.Exempt = func(sym string) bool { _, ok := portfolio.BondInfoFor(sym); return ok }
 

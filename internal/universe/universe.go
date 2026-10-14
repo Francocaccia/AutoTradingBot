@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"regexp"
 	"strings"
 	"sync"
@@ -26,6 +27,24 @@ const (
 	checksPerSlot   = 4 // validation attempts allowed per candidate slot
 	screenerPerList = 10
 )
+
+// Limits are the quality and liquidity thresholds for screener candidates
+// (core watchlist and bond ETFs are exempt). A zero value disables the matching
+// check; MinDollarVol == 0 also disables the dollar-volume fallback.
+type Limits struct {
+	MaxDayMovePct float64 // reject when |last bar close vs previous close| exceeds this, %
+	MaxRangePct   float64 // reject when (high-low)/close of the last bar exceeds this, %
+	MaxATRPct     float64 // reject when ATR(14)/price exceeds this, %
+	MinMarketCap  float64 // reject below this USD market cap; skipped when the cap is unknown
+	// MinDollarVol is the minimum average daily dollar volume (Alpaca bars, 60
+	// sessions) that qualifies a candidate when Yahoo average volume is unavailable.
+	MinDollarVol float64
+}
+
+// DefaultLimits are the defaults of the CANDIDATE_* and LIQUIDITY_MIN_DOLLAR_VOL settings.
+func DefaultLimits() Limits {
+	return Limits{MaxDayMovePct: 20, MaxRangePct: 15, MaxATRPct: 7, MinMarketCap: 2e9, MinDollarVol: 20_000_000}
+}
 
 var allowedExchanges = map[string]bool{"NYSE": true, "NASDAQ": true, "ARCA": true}
 
@@ -91,6 +110,8 @@ type Universe struct {
 	// average-volume filters. The leveraged/inverse check still applies. May be nil.
 	// Core watchlist symbols skip the average-volume filter too (price still applies).
 	Exempt func(symbol string) bool
+	// Limits applies to screener candidates only (DefaultLimits from New).
+	Limits Limits
 	// Held lists symbols currently held; a candidate whose other share class
 	// is held is skipped. Set by the scheduler each cycle.
 	Held []string
@@ -105,7 +126,7 @@ type Universe struct {
 func New(core []string, maxCandidates int, assets Assets, screener Screener, fetch Fetcher) *Universe {
 	return &Universe{
 		Core: core, MaxCandidates: maxCandidates, Assets: assets, Screener: screener, Fetch: fetch,
-		now: time.Now, rejected: map[string]time.Time{},
+		now: time.Now, rejected: map[string]time.Time{}, Limits: DefaultLimits(),
 	}
 }
 
@@ -189,13 +210,13 @@ func (u *Universe) Build(newsSymbols []string) []Item {
 		if duplicateClass(sym, represented) { // a sibling was accepted earlier in this loop
 			continue
 		}
-		ind, err := u.validateMarket(sym, assets[sym])
+		ind, liq, err := u.validateMarket(sym, assets[sym])
 		if err != nil {
 			log.Printf("[Universe] candidate %s rejected: %v", sym, err)
 			u.reject(sym)
 			continue
 		}
-		log.Printf("[Universe] candidate %s accepted (price $%.2f, avg vol %.1fM)", sym, ind.Price, ind.AvgVolume/1e6)
+		log.Printf("[Universe] candidate %s accepted (price $%.2f, %s)", sym, ind.Price, liq)
 		items = append(items, Item{Symbol: sym, Ind: ind, Validated: true})
 		represented[sym] = true
 		added++
@@ -247,7 +268,8 @@ func (u *Universe) Validate(symbol string) (*indicators.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return u.validateMarket(symbol, asset)
+	ind, _, err := u.validateMarket(symbol, asset)
+	return ind, err
 }
 
 // checkedAsset runs the symbol and Alpaca-side filters. cache (optional)
@@ -279,29 +301,37 @@ func (u *Universe) checkedAsset(symbol string, cache map[string]*Asset) (*Asset,
 	return asset, nil
 }
 
-func (u *Universe) validateMarket(symbol string, asset *Asset) (*indicators.Result, error) {
+// validateMarket fetches the symbol's data and applies the market filters. For
+// a screener candidate the second result says how liquidity was established.
+func (u *Universe) validateMarket(symbol string, asset *Asset) (*indicators.Result, string, error) {
 	ind, err := u.Fetch(symbol)
 	if err != nil {
-		return nil, fmt.Errorf("market data fetch failed: %w", err)
+		return nil, "", fmt.Errorf("market data fetch failed: %w", err)
 	}
 	// Screener candidates fail CLOSED on every filter, including unknown volume.
 	// The curated bond ETFs and the core watchlist are known, liquid names: an
 	// unavailable volume (Yahoo failing from a cloud IP) must not drop them.
 	exempt := u.Exempt != nil && u.Exempt(symbol)
-	check := CheckMarket
 	switch {
 	case exempt:
-		check = CheckMarketExempt
+		if err := CheckMarketExempt(asset, ind); err != nil {
+			return nil, "", err
+		}
 	case u.isCore(symbol):
-		check = CheckMarketCore
+		if err := CheckMarketCore(asset, ind); err != nil {
+			return nil, "", err
+		}
+	default:
+		liq, err := CheckCandidate(asset, ind, u.Limits)
+		if err != nil {
+			return nil, "", err
+		}
+		return ind, liq, nil
 	}
-	if err := check(asset, ind); err != nil {
-		return nil, err
-	}
-	if ind.AvgVolume <= 0 && (exempt || u.isCore(symbol)) {
+	if ind.AvgVolume <= 0 {
 		log.Printf("[Universe] WARN %s: avg daily volume unavailable, keeping it (core watchlist / bond ETF sleeve are exempt from the liquidity filter)", symbol)
 	}
-	return ind, nil
+	return ind, "", nil
 }
 
 func (u *Universe) isCore(symbol string) bool { return contains(u.Core, symbol) }
@@ -333,27 +363,69 @@ func CheckAsset(a *Asset) error {
 	return nil
 }
 
-// CheckMarket applies the price, liquidity and ETF-name filters to fetched data.
+// CheckMarket applies the price, liquidity and ETF-name filters to fetched
+// data, without the candidate quality limits or the dollar-volume fallback.
 func CheckMarket(a *Asset, ind *indicators.Result) error {
+	_, err := CheckCandidate(a, ind, Limits{})
+	return err
+}
+
+// CheckCandidate applies every filter a screener candidate must pass: price,
+// liquidity, the quality limits (day move, range, ATR, market cap) and the
+// ETF-name check. Liquidity comes from Yahoo average volume; only when that
+// is unavailable and lim.MinDollarVol > 0 does the Alpaca-bars average dollar
+// volume qualify instead. The result names the liquidity source and value
+// (for the log). Rejection errors carry the measured value.
+func CheckCandidate(a *Asset, ind *indicators.Result, lim Limits) (string, error) {
 	if ind == nil {
-		return errors.New("no market data")
+		return "", errors.New("no market data")
 	}
 	if ind.Price < MinPrice {
-		return fmt.Errorf("price $%.2f below $%.0f", ind.Price, MinPrice)
+		return "", fmt.Errorf("price $%.2f below $%.0f", ind.Price, MinPrice)
 	}
-	if ind.AvgVolume <= 0 {
-		return errors.New("avg daily volume unavailable")
+	var liq string
+	switch {
+	case ind.AvgVolume > 0:
+		if ind.AvgVolume < MinAvgVolume {
+			return "", fmt.Errorf("avg daily volume %.0f below %.0f", ind.AvgVolume, MinAvgVolume)
+		}
+		src := ind.VolumeSource
+		if src == "" {
+			src = "yahoo"
+		}
+		liq = fmt.Sprintf("avg vol %.1fM (%s)", ind.AvgVolume/1e6, src)
+	case lim.MinDollarVol > 0 && ind.AvgDollarVolume > 0:
+		if ind.AvgDollarVolume < lim.MinDollarVol {
+			return "", fmt.Errorf("avg daily volume unavailable (Yahoo); Alpaca-bars average dollar volume $%.1fM below $%.0fM", ind.AvgDollarVolume/1e6, lim.MinDollarVol/1e6)
+		}
+		liq = fmt.Sprintf("avg dollar vol $%.1fM (Alpaca bars fallback, Yahoo volume unavailable)", ind.AvgDollarVolume/1e6)
+	default:
+		return "", errors.New("avg daily volume unavailable (Yahoo), and no Alpaca dollar-volume fallback")
 	}
-	if ind.AvgVolume < MinAvgVolume {
-		return fmt.Errorf("avg daily volume %.0f below %.0f", ind.AvgVolume, MinAvgVolume)
+
+	if lim.MaxDayMovePct > 0 && math.Abs(ind.DayChangePct) > lim.MaxDayMovePct {
+		return "", fmt.Errorf("1-day price change %+.1f%% exceeds %.0f%%", ind.DayChangePct, lim.MaxDayMovePct)
 	}
+	if lim.MaxRangePct > 0 && ind.RangePct > lim.MaxRangePct {
+		return "", fmt.Errorf("intraday range %.1f%% of price exceeds %.0f%%", ind.RangePct, lim.MaxRangePct)
+	}
+	if lim.MaxATRPct > 0 && ind.Price > 0 {
+		if pct := ind.ATR / ind.Price * 100; pct > lim.MaxATRPct {
+			return "", fmt.Errorf("ATR(14) %.1f%% of price exceeds %.0f%%", pct, lim.MaxATRPct)
+		}
+	}
+	// Market cap comes from Yahoo fundamentals; when it is unavailable the check is skipped.
+	if lim.MinMarketCap > 0 && ind.MarketCap > 0 && ind.MarketCap < lim.MinMarketCap {
+		return "", fmt.Errorf("market cap $%.2fB below $%.1fB", ind.MarketCap/1e9, lim.MinMarketCap/1e9)
+	}
+
 	isETF := ind.QuoteType != "" && !strings.EqualFold(ind.QuoteType, "EQUITY")
 	for _, name := range []string{ind.Name, nameOf(a)} {
 		if IsLeveragedOrInverse(name, isETF) {
-			return fmt.Errorf("leveraged/inverse product %q", name)
+			return "", fmt.Errorf("leveraged/inverse product %q", name)
 		}
 	}
-	return nil
+	return liq, nil
 }
 
 // CheckMarketCore is CheckMarket without the average-volume filter, for the

@@ -2,6 +2,8 @@ package indicators
 
 import (
 	"errors"
+	"log"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -147,8 +149,11 @@ func TestFundamentalsRetryWithBackoffThenSucceed(t *testing.T) {
 	if err != nil || res.AvgVolume != 5_000_000 {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
-	if fundCalls != 3 || len(sleeps) != 2 || sleeps[0] != 2*time.Second || sleeps[1] != 5*time.Second {
-		t.Errorf("fundamentals calls=%d sleeps=%v, want 3 attempts with 2s/5s backoff", fundCalls, sleeps)
+	// 2s and 5s backoff, each plus up to 50% jitter.
+	if fundCalls != 3 || len(sleeps) != 2 ||
+		sleeps[0] < 2*time.Second || sleeps[0] > 3*time.Second ||
+		sleeps[1] < 5*time.Second || sleeps[1] > 7500*time.Millisecond {
+		t.Errorf("fundamentals calls=%d sleeps=%v, want 3 attempts with 2s/5s backoff plus up to 50%% jitter", fundCalls, sleeps)
 	}
 }
 
@@ -183,15 +188,21 @@ func TestLastGoodAvgVolumeIsFallbackFor24h(t *testing.T) {
 		return []byte(fundsJSON), nil, nil
 	})
 	p.now = func() time.Time { return now }
-	if res, _ := p.Calculate("AAA"); res.AvgVolume != 5_000_000 {
+	if res, _ := p.Calculate("AAA"); res.AvgVolume != 5_000_000 || res.VolumeSource != "yahoo" {
 		t.Fatalf("first fetch: %+v", res)
 	}
 
 	failing = true
+	var logs strings.Builder
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
 	now = now.Add(13 * time.Hour) // fundamentals expired and the refresh fails
 	res, err := p.Calculate("AAA")
 	if err != nil || res.AvgVolume != 5_000_000 {
 		t.Fatalf("a failed refresh must fall back to the last good volume: %+v %v", res, err)
+	}
+	if res.VolumeSource != "cache" || !strings.Contains(logs.String(), "using the cached value") {
+		t.Errorf("a cached volume must be labelled and logged: source=%q logs=%q", res.VolumeSource, logs.String())
 	}
 	if res.Sector != "" {
 		t.Errorf("only the volume falls back, got %+v", res)
@@ -200,5 +211,18 @@ func TestLastGoodAvgVolumeIsFallbackFor24h(t *testing.T) {
 	now = now.Add(12 * time.Hour) // 25h since the last good value
 	if res, _ := p.Calculate("AAA"); res.AvgVolume != 0 {
 		t.Errorf("a fallback older than 24h must not be used: %+v", res)
+	}
+}
+
+func TestCandidateMetricsAndMarketCapAreParsed(t *testing.T) {
+	bars := `{"AAA":{"price":12.5,"atr":1,"avg_dollar_volume":42000000,"day_change_pct":-51.9,"range_pct":18.5,"source":"alpaca-iex"}}`
+	funds := `{"AAA":{"avg_volume":5000000,"market_cap":3000000000,"quote_type":"EQUITY"}}`
+	p, _, _ := newTestProvider(bars, funds)
+	res, err := p.Calculate("AAA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AvgDollarVolume != 42_000_000 || res.DayChangePct != -51.9 || res.RangePct != 18.5 || res.MarketCap != 3e9 {
+		t.Errorf("metrics = %+v", res)
 	}
 }
