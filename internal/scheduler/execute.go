@@ -432,6 +432,12 @@ func (s *Scheduler) orderFailed(cs *cycleState, symbol, action, what string, err
 		cs.drop(symbol, action, "duplicate", err.Error())
 		return false
 	}
+	// The broker layer counts the day's and week's orders from Alpaca right before
+	// sending and refuses a BUY over a cap, whatever this cycle's counters say.
+	if errors.Is(err, broker.ErrCapReached) {
+		cs.drop(symbol, action, "cap", err.Error())
+		return false
+	}
 	log.Printf("[%s] %s failed: %v", symbol, what, err)
 	return false
 }

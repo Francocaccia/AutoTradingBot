@@ -31,9 +31,15 @@ type fakeOrders struct {
 	seen map[string]bool
 	// cancelled counts CancelOpenOrders calls.
 	cancelled int
+	// capErr, when set, is what every BUY returns: the broker layer's own count of
+	// the day's and week's orders (broker.ErrCapReached) disagreeing with the cycle's.
+	capErr error
 }
 
 func (f *fakeOrders) once(symbol string, side broker.Side) error {
+	if f.capErr != nil && side == broker.Buy {
+		return f.capErr
+	}
 	key := symbol + " " + string(side)
 	if f.seen[key] {
 		return fmt.Errorf("%w: %s", broker.ErrDuplicateOrder, key)

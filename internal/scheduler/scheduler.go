@@ -178,10 +178,11 @@ type Scheduler struct {
 	runCycle  func() // one decision cycle (runMarketCycle; replaced in tests)
 	lastSlot  string // key of the last slot a cycle ran in
 	lastCycle time.Time
-	skipDay   string    // ET date on which the market is closed for good: no more slots are tried
-	newsAt    time.Time // when the news cache was last refreshed
-	fetchNews func()    // reloads s.newsCache (fetchAndCacheNews; replaced in tests)
-	dry       bool      // an advisory dry run is in progress: logs say "would BUY" (see advisory.go)
+	skipDay   string      // ET date on which the market is closed for good: no more slots are tried
+	newsAt    time.Time   // when the news cache was last refreshed
+	fetchNews func()      // reloads s.newsCache (fetchAndCacheNews; replaced in tests)
+	marks     markerStore // durable facts (the weekly review marker); nil when not needed
+	dry       bool        // an advisory dry run is in progress: logs say "would BUY" (see advisory.go)
 	slotsRun  int
 }
 
@@ -208,6 +209,7 @@ func New(cfg Config) *Scheduler {
 	}
 	if cfg.Broker != nil {
 		s.orders = cfg.Broker
+		s.marks = cfg.Broker
 	}
 	if cfg.Portfolio != nil {
 		s.acct = cfg.Portfolio

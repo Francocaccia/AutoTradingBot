@@ -35,6 +35,9 @@ type AlpacaClient struct {
 	baseURL   string
 	http      *http.Client
 	now       func() time.Time // overridden in tests
+
+	capDay, capWeek int    // trade caps checked before every BUY (SetTradeCaps); <= 0 means none
+	capFrom         string // orders before this ET date are not counted
 }
 
 func NewAlpacaClient(apiKey, apiSecret, baseURL string) *AlpacaClient {
@@ -208,7 +211,7 @@ type orderRequest struct {
 // PlaceMarketOrder submits a plain market order of the given kind (KindEntry,
 // KindExit or KindRebalance). See nextOrderID for the duplicate protection.
 func (c *AlpacaClient) PlaceMarketOrder(symbol string, qty int, side Side, kind string) error {
-	id, err := c.nextOrderID(symbol, side, kind)
+	id, err := c.prepareOrder(symbol, side, kind)
 	if err != nil {
 		return err
 	}
@@ -242,7 +245,7 @@ const bracketTimeInForce = "gtc"
 // PlaceBracketOrder submits a market entry order with attached take-profit
 // and stop-loss legs (order_class: bracket).
 func (c *AlpacaClient) PlaceBracketOrder(symbol string, qty int, side Side, stopLoss, takeProfit float64, kind string) error {
-	id, err := c.nextOrderID(symbol, side, kind)
+	id, err := c.prepareOrder(symbol, side, kind)
 	if err != nil {
 		return err
 	}
@@ -276,7 +279,7 @@ type otoOrderRequest struct {
 // (order_class: oto). Used for bond ETFs and policy rebalancing trades, which
 // are reviewed on a schedule instead of carrying a take-profit.
 func (c *AlpacaClient) PlaceOTOOrder(symbol string, qty int, side Side, stopLoss float64, kind string) error {
-	id, err := c.nextOrderID(symbol, side, kind)
+	id, err := c.prepareOrder(symbol, side, kind)
 	if err != nil {
 		return err
 	}

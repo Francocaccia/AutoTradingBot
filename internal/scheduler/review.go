@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -14,6 +15,39 @@ import (
 
 // maxReviewActions is how many of the review's recommended actions are considered.
 const maxReviewActions = 2
+
+// markerStore keeps small facts across restarts in the broker account (see
+// broker.HasMarker). *broker.AlpacaClient is the production implementation.
+type markerStore interface {
+	HasMarker(name string) (bool, error)
+	SetMarker(name string) error
+	ClearMarker(name string) error
+}
+
+// reviewMarker names the fact "the weekly review ran in the week of this date".
+// The week is identified by its Monday, so a restart on any day of that week
+// finds it.
+func reviewMarker(t time.Time) string {
+	t = t.In(eastern)
+	monday := t.AddDate(0, 0, -((int(t.Weekday()) + 6) % 7))
+	return "atb-weekly-review-" + monday.Format("2006-01-02")
+}
+
+var errMarkerUnknown = errors.New("weekly review marker unavailable")
+
+// reviewDoneThisWeek reads the marker. The process memory is only a shortcut: a
+// restart wipes it, the marker does not. An unreadable marker is an error, never
+// "not done", so a failing broker cannot make the review repeat.
+func (s *Scheduler) reviewDoneThisWeek(sess *market.Session) (bool, error) {
+	if s.marks == nil {
+		return false, nil
+	}
+	has, err := s.marks.HasMarker(reviewMarker(sess.Now))
+	if err != nil {
+		return false, fmt.Errorf("%w: %v", errMarkerUnknown, err)
+	}
+	return has, nil
+}
 
 // reviewDecision says whether the weekly portfolio review (one Gemini call)
 // should run now: on the first eligible cycle on Monday after 10:00 ET. Bringing
@@ -29,6 +63,13 @@ func (s *Scheduler) reviewDecision(cs *cycleState, sess *market.Session) (reason
 	case s.lastReviewDay == sess.Date:
 		return "", "already ran today"
 	case sess.Now.Weekday() == time.Monday:
+		done, err := s.reviewDoneThisWeek(sess)
+		switch {
+		case err != nil:
+			return "", "weekly review skipped this cycle: " + err.Error()
+		case done:
+			return "", "already ran this week (marker found in the account)"
+		}
 		return "weekly review", ""
 	}
 	return "", "not due: runs on Mondays"
@@ -66,7 +107,15 @@ func (s *Scheduler) maybeReview(cs *cycleState, sess *market.Session) {
 		cs.why(fmt.Sprintf("%s is due, but Gemini is paused (%s)", reason, why))
 		return
 	}
-	// Mark the day before calling so a failing call is not retried every cycle.
+	// Record the review before calling, durably: a restart must not repeat it. If
+	// the marker cannot be written the review does not run (it would be repeated by
+	// the next restart); a failing call is not retried every cycle either.
+	if s.marks != nil {
+		if err := s.marks.SetMarker(reviewMarker(sess.Now)); err != nil {
+			cs.why("weekly review not run: cannot record that it ran (" + err.Error() + ")")
+			return
+		}
+	}
 	s.lastReviewDay = sess.Date
 
 	block := analysis.Render(cs.pf.in, nil)
@@ -82,8 +131,14 @@ func (s *Scheduler) maybeReview(cs *cycleState, sess *market.Session) {
 	r, err := s.llm.Review(prompt)
 	if err != nil {
 		if stopOnQuota(cs, err) {
-			// No budget for the review: the day is free to retry on a later cycle.
+			// No budget for the review: the day is free to retry on a later cycle,
+			// so the marker goes too.
 			s.lastReviewDay = ""
+			if s.marks != nil {
+				if cerr := s.marks.ClearMarker(reviewMarker(sess.Now)); cerr != nil {
+					log.Printf("[WeeklyReview] could not clear the marker after a quota error: %v", cerr)
+				}
+			}
 			cs.why(fmt.Sprintf("%s is due, but there is no Gemini budget (%v)", reason, err))
 			return
 		}

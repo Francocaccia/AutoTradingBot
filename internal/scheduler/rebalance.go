@@ -383,6 +383,10 @@ func (s *Scheduler) execRebalance(cs *cycleState) {
 		log.Printf("[Rebalance] %s skipped: %v", p.symbol, err)
 		cs.why("rebalance: " + p.symbol + " already ordered today")
 		return
+	case errors.Is(err, broker.ErrCapReached):
+		log.Printf("[Rebalance] %s skipped: %v", p.symbol, err)
+		cs.why("rebalance: " + err.Error())
+		return
 	case err != nil:
 		log.Printf("[Rebalance] %s BUY failed: %v", p.symbol, err)
 		cs.why("rebalance: order failed")

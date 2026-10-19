@@ -69,6 +69,10 @@ func main() {
 	// GET /models does not use generate quota: drop configured models that do not exist.
 	geminiClient.VerifyModels()
 	port := portfolio.NewPortfolio(alpacaClient)
+	// The trade caps are enforced once more in the order path itself, counted from
+	// Alpaca, so overlapping instances cannot exceed them together.
+	alpacaClient.SetTradeCaps(envPositive("MAX_TRADES_PER_DAY", defaultMaxTradesDay), envPositive("MAX_TRADES_PER_WEEK", defaultMaxTradesWeek),
+		envDate("GUARDS_START_DATE", defaultGuardsStartDate))
 
 	tracker := stats.New(stats.AlpacaSource{Broker: alpacaClient, MarketData: dataClient}, envString("TRACK_START_DATE", stats.DefaultStartDate))
 	// Browsers may read /stats/history from the owner's GitHub Pages site, an

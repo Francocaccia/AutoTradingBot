@@ -516,3 +516,46 @@ func TestOrdinaryBuysCarryTheEntryKind(t *testing.T) {
 		t.Errorf("order %+v did %v", ord, cs.did)
 	}
 }
+
+// A bond ETF bought by the policy and then stopped out must not turn into a
+// stop-and-rebuy loop: one tranche a day caps the same-day case, and the next
+// day's tranche carries a stop at least 3% away, so noise does not repeat it.
+func TestStoppedPolicyBondETFCannotLoop(t *testing.T) {
+	calm := func() (*Scheduler, *fakeOrders) {
+		s, o := policyScheduler("gradual")
+		s.cfg.RebalanceBondETFs = []string{"SHY"}
+		s.fetchBond = func(string) (*indicators.Result, error) { return &indicators.Result{Price: 82, ATR: 0.3}, nil }
+		return s, o
+	}
+
+	// Bought at 10:15, stopped at 10:45, same day: no second tranche today.
+	s, o := calm()
+	cs := policyCycle(s, 72_000, map[string]float64{"AAPL": 28_000},
+		rebFill("SHY", "2026-10-15 10:15"), fill("SHY", "sell", "stop", "2026-10-15 10:45", 61))
+	runPolicy(s, cs)
+	if len(o.placed) != 0 || !strings.Contains(strings.Join(cs.whyNot, ";"), "one trade per day already made") {
+		t.Errorf("same day: orders %+v why %v", o.placed, cs.whyNot)
+	}
+
+	// The next day the floor is still short, so it is bought again, with a wide stop.
+	s, o = calm()
+	cs = policyCycle(s, 72_000, map[string]float64{"AAPL": 28_000},
+		rebFill("SHY", "2026-10-14 10:15"), fill("SHY", "sell", "stop", "2026-10-14 10:45", 61))
+	runPolicy(s, cs)
+	if len(o.placed) != 1 || o.placed[0].symbol != "SHY" || o.placed[0].kind != "oto" {
+		t.Fatalf("next day: orders %+v (%v)", o.placed, cs.whyNot)
+	}
+	if dist := (82 - o.placed[0].stop) / 82 * 100; dist < 3-1e-6 {
+		t.Errorf("stop %.2f is only %.2f%% below 82, the floor is 3%%", o.placed[0].stop, dist)
+	}
+
+	// And the weekly limit of two tranches stops a longer loop.
+	s, o = calm()
+	cs = policyCycle(s, 72_000, map[string]float64{"AAPL": 28_000},
+		rebFill("SHY", "2026-10-13 10:15"), fill("SHY", "sell", "stop", "2026-10-13 10:45", 61),
+		rebFill("SHY", "2026-10-14 10:15"), fill("SHY", "sell", "stop", "2026-10-14 10:45", 61))
+	runPolicy(s, cs)
+	if len(o.placed) != 0 || !strings.Contains(strings.Join(cs.whyNot, ";"), "weekly limit reached") {
+		t.Errorf("third tranche in the week: %+v %v", o.placed, cs.whyNot)
+	}
+}
