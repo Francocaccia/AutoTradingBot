@@ -16,3 +16,10 @@ services:
         sync: false
       - key: TRACK_START_DATE
         value: "2026-10-13"
+      # Optional: a custom domain allowed to read /stats/history from a browser.
+      - key: CORS_EXTRA_ORIGIN
+        sync: false
+      # advisory | gradual | off. Start with advisory (logs the rebalancing trade it
+      # would make, places nothing), then switch to gradual in the dashboard.
+      - key: IPS_BANDS_MODE
+        sync: false

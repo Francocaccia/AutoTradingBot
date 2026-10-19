@@ -42,6 +42,12 @@ const (
 	defaultEvalCooldownMin  = 90
 	defaultBatchMaxSymbols  = 12
 
+	defaultBlackoutMin      = 10
+	defaultMinPolicyStopPct = 3.0
+
+	defaultRebalanceTranchePct = 5.0
+	defaultRebalanceMaxWeek    = 2
+
 	// defaultGuardsStartDate is the deploy date of the "atb-" order tagging:
 	// decisions before it do not count toward the daily/weekly caps.
 	defaultGuardsStartDate = "2026-10-14"
@@ -65,6 +71,9 @@ func main() {
 	port := portfolio.NewPortfolio(alpacaClient)
 
 	tracker := stats.New(stats.AlpacaSource{Broker: alpacaClient, MarketData: dataClient}, envString("TRACK_START_DATE", stats.DefaultStartDate))
+	// Browsers may read /stats/history from the owner's GitHub Pages site, an
+	// optional custom domain (CORS_EXTRA_ORIGIN) and localhost; nobody else.
+	tracker.SetOriginPolicy(stats.OriginPolicy(os.Getenv("CORS_EXTRA_ORIGIN")))
 
 	maxCandidates := envInt("UNIVERSE_MAX_CANDIDATES", defaultMaxCandidates)
 	uni := universe.New(coreWatchlist, maxCandidates, universe.BrokerAssets{Broker: alpacaClient}, dataClient, indicators.Calculate)
@@ -88,7 +97,23 @@ func main() {
 		policy.EquityMin, policy.EquityMax, policy.BondMin, policy.BondMax, policy.CashMin, policy.CashMax,
 		policy.TargetEquity, policy.TargetBond, policy.TargetCash,
 		policy.MaxStockPct, policy.MaxBondETFPct, policy.SectorMaxPct, policy.CreditMaxPct, policy.MaxDuration)
+	tracker.SetBands(stats.Bands{
+		Equities: stats.Band{Min: policy.EquityMin, Max: policy.EquityMax},
+		Bonds:    stats.Band{Min: policy.BondMin, Max: policy.BondMax},
+		Cash:     stats.Band{Min: policy.CashMin, Max: policy.CashMax},
+	})
 	bonds := setupBonds(alpacaClient)
+
+	bandsMode, modeOK := scheduler.NormalizeBandsMode(os.Getenv("IPS_BANDS_MODE"))
+	if !modeOK {
+		log.Printf("[Policy] invalid IPS_BANDS_MODE %q (want gradual, advisory or off), using %s", os.Getenv("IPS_BANDS_MODE"), bandsMode)
+	}
+	rebalanceTranche := envFloat("REBALANCE_TRANCHE_PCT", defaultRebalanceTranchePct)
+	if rebalanceTranche <= 0 {
+		rebalanceTranche = defaultRebalanceTranchePct
+	}
+	log.Printf("[Policy] IPS_BANDS_MODE=%s: a sleeve below its minimum band is %s; tranche %.1f%% of equity, at most %d rebalancing trades per week and one per day",
+		bandsMode, bandsModeText(bandsMode), rebalanceTranche, envPositive("REBALANCE_MAX_TRADES_PER_WEEK", defaultRebalanceMaxWeek))
 
 	sched := scheduler.New(scheduler.Config{
 		Broker:           alpacaClient,
@@ -116,6 +141,16 @@ func main() {
 		Policy:              policy,
 		Bonds:               bonds,
 		Analyzer:            analysis.NewAnalyzer(dataClient),
+
+		EntryBlackoutOpen:  time.Duration(envInt("ENTRY_BLACKOUT_OPEN_MIN", defaultBlackoutMin)) * time.Minute,
+		EntryBlackoutClose: time.Duration(envInt("ENTRY_BLACKOUT_CLOSE_MIN", defaultBlackoutMin)) * time.Minute,
+		MinStopATRMult:     envFloat("MIN_STOP_ATR_MULT", risk.StopATRMultiple),
+		MinPolicyStopPct:   policyStopPct(envFloat("MIN_POLICY_STOP_PCT", defaultMinPolicyStopPct)),
+
+		IPSBandsMode:              bandsMode,
+		RebalanceTranchePct:       rebalanceTranche,
+		RebalanceMaxTradesPerWeek: envPositive("REBALANCE_MAX_TRADES_PER_WEEK", defaultRebalanceMaxWeek),
+		RebalanceBondETFs:         envList("REBALANCE_BOND_ETFS"),
 	})
 
 	// Health endpoint so the host (Render) and an uptime monitor can reach the bot.
@@ -124,14 +159,12 @@ func main() {
 		httpPort = "8080"
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("/health", healthHandler)
 	mux.Handle("/stats", tracker.Handler())
-	srv := &http.Server{Addr: ":" + httpPort, Handler: mux}
+	mux.Handle("/stats/history", tracker.HistoryHandler())
+	srv := &http.Server{Addr: ":" + httpPort, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
-		log.Printf("HTTP server listening on :%s (/health, /stats)", httpPort)
+		log.Printf("HTTP server listening on :%s (/health, /stats, /stats/history)", httpPort)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server error: %v", err)
 		}
@@ -149,6 +182,47 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)
+}
+
+// healthHandler answers the host's and the uptime pinger's checks. It touches
+// nothing outside the process (no broker, no market data, no model), so it is
+// fast and cannot fail because an upstream is down.
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		w.Write([]byte("ok"))
+	}
+}
+
+// policyStopPct maps MIN_POLICY_STOP_PCT to the scheduler's convention: 0 means
+// "no stop on policy trades", which the scheduler reads as a negative value.
+func policyStopPct(v float64) float64 {
+	if v == 0 {
+		return -1
+	}
+	return v
+}
+
+func bandsModeText(mode string) string {
+	switch mode {
+	case "advisory":
+		return "only logged, no order is placed"
+	case "off":
+		return "left alone"
+	}
+	return "filled with core ETFs in tranches"
+}
+
+// envList reads a comma-separated upper-case symbol list; nil when unset.
+func envList(name string) []string {
+	var out []string
+	for _, v := range strings.Split(os.Getenv(name), ",") {
+		if v = strings.ToUpper(strings.TrimSpace(v)); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func envString(name, def string) string {

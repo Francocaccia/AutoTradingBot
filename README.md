@@ -8,42 +8,24 @@ An autonomous paper-trading bot written in Go. Every 15 minutes (configurable) d
 
 The bot manages a small **multi-asset investor portfolio** (stocks, equity ETFs, bond ETFs and cash), not a stock picker. The objective is to **maximize risk-adjusted return (Sharpe-like) subject to a drawdown limit**, benchmarked against **SPY** and a **60/40 (SPY/AGG)** portfolio. "Highest return with lowest risk" is a trade-off: the bot must never take extra risk just to chase return, and must never trade just to be active. The same framing is the first thing the model reads in every prompt.
 
-## Live track record
+## Risk controls at a glance
 
-[autotradingbot-kjr0.onrender.com/stats](https://autotradingbot-kjr0.onrender.com/stats): percentages only, from the paper account, benchmarked against SPY, tracking since `TRACK_START_DATE` (default `2026-10-13`). Computed on demand from Alpaca and cached for 5 minutes; the free Render instance may take about a minute to wake up. Before two trading days of data exist, every metric is `null` and `note` is `"insufficient data"`.
+Everything below is enforced in code, not by the prompt (details in [Risk controls](#risk-controls) and [Portfolio construction](#portfolio-construction)):
 
-Example shape (**placeholder numbers, not real results**):
-
-```json
-{
-  "start_date": "2026-10-13",
-  "days_tracked": 20,
-  "bot_return_pct": 1.84,
-  "spy_return_pct": 2.31,
-  "excess_return_pct": -0.47,
-  "max_drawdown_pct": -2.65,
-  "best_day_pct": 1.12,
-  "worst_day_pct": -1.38,
-  "num_trades": 14,
-  "win_rate_pct": 57.14,
-  "open_positions_count": 3,
-  "benchmark_60_40_return_pct": 1.12,
-  "bot_vs_60_40_pct": 0.72,
-  "max_drawdown_spy_pct": -3.4,
-  "max_drawdown_60_40_pct": -1.9,
-  "risk_adjusted": {"bot": 1.31, "spy": 1.05, "benchmark_60_40": 1.22},
-  "allocation_pct": {"equities": 58.2, "bonds": 22.5, "cash": 19.3},
-  "last_updated": "2026-11-10T21:05:00Z"
-}
-```
-
-Returns are measured from the close before the start date. `max_drawdown_pct` is the worst peak-to-trough decline of the daily equity curve (negative). `win_rate_pct` counts round trips opened and closed since the start (average-cost P&L) and is `null` until one closes. `benchmark_60_40_return_pct` is 60% SPY / 40% AGG rebalanced daily. `risk_adjusted` is mean daily return over its standard deviation, annualized (no risk-free rate); it reads `"insufficient data"` until 20 trading days exist. `allocation_pct` splits equity into sleeves (cash includes T-bill ETFs). No dollar amounts, share counts, held symbols or account identifiers are ever returned.
+- **Long-only, paper only.** No shorting, margin, leverage or options.
+- **Every entry has a server-side stop.** Stocks get a bracket (stop at 2x ATR, take-profit at least 2:1); bond and policy ETFs get a stop-only order.
+- **Per-trade loss cap** (`MAX_RISK_PCT`, default 1% of equity at the stop) and a **single-position cap** (`MAX_POSITION_PCT`, default 10%).
+- **Investment policy bands** for equities, bonds and cash, sector, credit and duration limits. Bands cap purchases; a sleeve under its minimum is filled gradually with core ETFs (`IPS_BANDS_MODE`).
+- **Circuit breakers:** no new positions after a 3% daily loss, BUYs halted at a 10% drawdown from the peak, no entries in the first and last 10 minutes of the session.
+- **Low turnover:** conviction and catalyst requirements, a minimum holding period, a re-entry cooldown, and daily and weekly trade caps.
+- **Restart-safe:** order ids are derived from the date, symbol, side and kind, so a restart cannot place the same order twice; counts and cooldowns are rebuilt from Alpaca's order history.
 
 ## How it works
 
 ```
-every CYCLE_INTERVAL_MIN (default 15) min (Mon–Fri, market hours per Alpaca's clock/calendar)
-  [no cycle at process start: the first one runs at the next tick]
+once per CYCLE_INTERVAL_MIN (default 15) slot of the New York trading day, counted from 09:30 ET
+  (Mon–Fri; Alpaca's clock and calendar decide whether the market is really open)
+  [a process that starts or wakes inside a slot runs ONE catch-up cycle; missed slots are not replayed]
   ├─ account + positions → circuit breakers, open/close buffer
   ├─ universe = core watchlist + up to N validated candidates
   │     (Alpaca screener, tickers in cached news, Gemini suggestions)
@@ -75,14 +57,14 @@ Sample output (illustrative; real logs will replace it):
 scheduler → universe filters → indicators → Gemini decision (JSON) → risk checks → Alpaca bracket orders
 ```
 
-1. **Scheduler** (`internal/scheduler`): ticks every `CYCLE_INTERVAL_MIN`, checks Alpaca's clock and calendar, and skips closed sessions.
+1. **Scheduler** (`internal/scheduler`): runs at most one cycle per `CYCLE_INTERVAL_MIN` slot of the America/New_York trading day (wall clock, not time since boot), checks Alpaca's clock and calendar, and skips closed sessions. A process that was asleep runs one catch-up cycle on wake, only while the market is open.
 2. **Universe filters** (`internal/universe`): core watchlist plus screened candidates, each passing the hard filters (exchange, price, volume, no leveraged ETFs or warrants).
 3. **Indicators**: Alpaca IEX daily bars feed a Python script (RSI, Ichimoku, MACD, Stochastic, Keltner, ATR); `yfinance` supplies fundamentals (beta, P/E, sector, average volume).
 4. **Gemini decision**: the prompt carries indicators, news and the current position; the model replies with JSON (`action`, `conviction`, `thesis`, `reasoning`, `suggested_tickers`).
 5. **Risk checks** (`internal/risk`): sizing by conviction, position and sector caps, reward:risk >= 2, circuit breakers. Enforced in code, not by the prompt.
 6. **Execution**: market entry with server-side stop-loss and take-profit legs (Alpaca bracket orders).
 
-Free-tier constraints: Gemini's free quota is small, so calls are rate limited, budgeted and gated by a per-symbol cooldown. Render's free web service sleeps after inactivity, so an UptimeRobot monitor pings `/health` to keep it awake (a sleeping bot runs no cycles). Render's disk is ephemeral, which is why nothing is persisted and `/stats` is derived from Alpaca.
+Free-tier constraints: Gemini's free quota is small, so calls are rate limited, budgeted and gated by a per-symbol cooldown. Render's free web service sleeps after 15 minutes without HTTP traffic, so a monitor pings `/health` (see [Deployment](#deployment)); a sleeping bot runs no cycles. Render's disk is ephemeral, which is why nothing is persisted and `/stats` is derived from Alpaca.
 
 ## Stack
 
@@ -95,7 +77,7 @@ Free-tier constraints: Gemini's free quota is small, so calls are rate limited, 
 ## Project structure
 
 ```
-cmd/bot/                 entrypoint, health endpoint, graceful shutdown
+cmd/bot/                 entrypoint, /health, /stats, /stats/history, graceful shutdown
 internal/scheduler/      market cycle, evaluation gate (cooldown/prefilter), order flow
 internal/broker/         Alpaca REST client (orders, positions, assets, calendar)
 internal/news/           Alpaca News client
@@ -107,11 +89,14 @@ internal/trades/         position age, re-entry and turnover counts from Alpaca 
 internal/portfolio/      account, positions, investment policy (bands, limits) and the curated bond ETFs
 internal/analysis/       60d volatility, beta, correlation and the PORTFOLIO prompt block
 internal/regime/         deterministic macro regime label from yields, VIX and 200d trends
-internal/stats/          GET /stats (computed from Alpaca, cached) and the in-memory equity peak
-internal/portfolio/      account and position lookup
+internal/stats/          GET /stats and GET /stats/history (computed from Alpaca, cached) and the in-memory equity peak
 internal/market/         market session (clock + calendar) and entry window
 internal/indicators/     Go wrapper around the Python script
 python/indicators/       indicator calculations (pure pandas)
+scripts/render_chart.py  draws docs/performance.svg and docs/allocation.svg from the public endpoints
+scripts/attribution.py   local report: splits the gap versus SPY into allocation, selection, core ETFs and trading
+scripts/entry_audit.py   local report: entry timing, stop distance, spreads and outcomes of every entry
+docs/                    the generated charts (updated by .github/workflows/chart.yml)
 render.yaml              Render blueprint
 ```
 
@@ -157,10 +142,19 @@ go run ./cmd/bot
 | `IPS_CREDIT_MAX_PCT` | HYG / EMB-type credit-risk bonds combined (default `10`) |
 | `IPS_MAX_DURATION` | Portfolio weighted bond duration cap, years (default `8`) |
 | `IPS_MIN_REAL_CASH_PCT` | Actual cash always kept, % of equity (default `2`) |
-| `CYCLE_INTERVAL_MIN` | Minutes between market cycles (default `15`) |
+| `IPS_BANDS_MODE` | What happens when a sleeve is below its band minimum: `gradual` (default) buys core ETFs in tranches, `advisory` only logs the trade it would make, `off` does nothing. Bands always cap purchases, whatever the mode. See "Band rebalancing" |
+| `REBALANCE_TRANCHE_PCT` | Most one rebalancing trade buys, % of equity (default `5`) |
+| `REBALANCE_MAX_TRADES_PER_WEEK` | Rebalancing trades per rolling 5 trading days (default `2`); at most one a day regardless |
+| `REBALANCE_BOND_ETFS` | Preference order of bond ETFs for the bond sleeve (default `AGG,SHY`; only enabled bond ETFs from the curated table are used, never T-bill ETFs) |
+| `MIN_POLICY_STOP_PCT` | Least distance, % of price, of the stop on a policy rebalancing buy (default `3`); the ATR stop is used if it is farther. `0` means no stop at all (a plain market order). See "Band rebalancing" |
+| `IPS_MAX_BROAD_ETF_PCT` | Largest single diversified index ETF (SPY, QQQ...), % of equity (default `20`); single stocks and sector ETFs keep `MAX_POSITION_PCT` |
+| `ENTRY_BLACKOUT_OPEN_MIN`, `ENTRY_BLACKOUT_CLOSE_MIN` | No new BUY in the first / last this-many minutes of the session (defaults `10`, `10`) |
+| `MIN_STOP_ATR_MULT` | Least ATR multiple of a stock stop (default `2.0`, which is also the floor: a smaller value cannot loosen it) |
+| `CYCLE_INTERVAL_MIN` | Length of a cycle slot in minutes; one cycle per slot (default `15`) |
 | `TRACK_START_DATE` | First day (`YYYY-MM-DD`) counted by `/stats` (default `2026-10-13`) |
+| `CORS_EXTRA_ORIGIN` | Extra browser origin allowed to read `/stats/history`, e.g. `https://example.org` for a custom domain (https://francocaccia.github.io and localhost are always allowed) |
 | `LOG_LEVEL` | `debug` also logs Gemini's full reasoning; anything else logs one line per decision (default `info`) |
-| `PORT` | Port for the `/health` and `/stats` endpoints (default `8080`) |
+| `PORT` | Port for the `/health`, `/stats` and `/stats/history` endpoints (default `8080`) |
 
 ## Selective by design
 
@@ -176,7 +170,7 @@ The bot works against an **investment policy statement (IPS)**, enforced in code
 | Bonds | 15-40 | bond ETFs (SHY, IEI, IEF, TLT, TIP, AGG, BND, LQD, VCSH, HYG, EMB) |
 | Cash | 5-30 | cash and T-bill ETFs (SGOV, BIL) |
 
-Limits: single stock <= 10% (`MAX_POSITION_PCT`), single bond ETF <= 15%, one sector <= 30% (an unknown sector counts as its own shared "Unknown" bucket, never as free diversification; broad index ETFs are exempt), credit-risk bonds (HYG, EMB) combined <= 10%, weighted bond duration <= 8 years (static duration table), at most `MAX_OPEN_POSITIONS` positions. A BUY is trimmed to the room the policy leaves, or rejected with the binding constraint logged if not even one share fits. Drift outside a band is never fixed with panic trades: it is handled by the weekly review.
+Limits: single stock <= 10% (`MAX_POSITION_PCT`), single bond ETF <= 15%, one sector <= 30% (an unknown sector counts as its own shared "Unknown" bucket, never as free diversification; broad index ETFs are exempt), credit-risk bonds (HYG, EMB) combined <= 10%, weighted bond duration <= 8 years (static duration table), at most `MAX_OPEN_POSITIONS` positions. A BUY is trimmed to the room the policy leaves, or rejected with the binding constraint logged if not even one share fits. Drift outside a band is never fixed with panic trades: a sleeve under its minimum is filled in small tranches (see "Band rebalancing"), and a sleeve over its maximum is never sold down, only not added to.
 
 **Bonds on this account.** At startup the bot calls `GET /v2/assets?status=active&asset_class=fixed_income` and logs a `[Capabilities]` line with exactly what Alpaca answered (HTTP status and asset count), then checks that each curated bond ETF is tradable. Alpaca's standard asset classes are US equities, options and crypto, so on a standard paper account individual Treasuries, corporate and sovereign bonds are **not expected to be tradable** (the probe reports what the account actually says) and **bond ETFs are the practical stand-in** (LQD / VCSH for investment-grade corporates, EMB for emerging-market sovereigns, IEF / TLT for Treasuries). The bot does not fake bond trading: even if the endpoint ever reports native bonds, it has no native order flow, logs that, and trades the ETFs. `BOND_MODE=off` disables the bond sleeve.
 
@@ -186,11 +180,22 @@ Limits: single stock <= 10% (`MAX_POSITION_PCT`), single bond ETF <= 15%, one se
 
 **Decision rules.** Every BUY or SELL must name a `role` (core, growth, income, hedge, cash_parking) and a `portfolio_rationale`. A bond ETF BUY needs conviction >= `MIN_BUY_CONVICTION` and a catalyst that is **one** item of the PORTFOLIO block: one full line, or one `label: value` token of a line (case and whitespace are normalized; a concatenation of several lines or phrases is rejected); stock BUYs need a quoted headline. A BUY whose average correlation to holdings exceeds 0.8 is rejected unless `replaces` names a held symbol, in which case that position is sold first (both orders must fit the holding period and turnover caps, or neither is placed). Cash inside its band is not a reason to buy anything: parking cash in SGOV / BIL is only accepted when actual cash is above its band maximum. All turnover guards apply to bond ETF trades.
 
-**Weekly review.** One extra Gemini call on the first eligible cycle on Monday after 10:00 ET (or once a day when a sleeve is more than 5 points outside its band) sees the whole portfolio and regime and returns target sleeve weights plus at most 2 actions. Targets are clipped into the bands (or rejected if they cannot sum to 100); actions become ordinary decisions that pass every guard. Review SELLs are exempt from `MIN_HOLD_DAYS` but count toward the trade caps. The outcome is logged on one `[Review]` line. The review runs at most once per process per day, and never while Gemini is paused (quota or budget).
+**Band rebalancing (`IPS_BANDS_MODE`).** The bands used to depend on the model proposing the right purchase, and in practice a sleeve could stay under its minimum for days (a 72% cash book never got its bonds). Rebalancing is now plain code that does not call the model:
 
-**What the review may buy.** Bond ETFs of the sleeve, T-bill cash-parking ETFs (SGOV, BIL) and the core equity ETFs (SPY, QQQ), validated against the IPS (the sleeve must be under its target, band maxima, single-name limits) rather than "bond ETFs only". When the review is caused by a band breach (a sleeve more than 5 points outside its band) the **code** writes the catalyst (for example `band breach: cash 69.0% > 30% max`) and skips the quote check; `portfolio_rationale`, conviction, the per-trade risk cap and the daily/weekly trade caps still apply, and the correlation rule is waived for these code-driven rebalance BUYs. A large breach is closed gradually: at most 5% of equity per trade (never past the sleeve target) and at most `MAX_TRADES_PER_DAY` trades a day, so a 39-point breach takes several days. Each rebalance BUY logs `rebalance in progress, N points remaining`.
+- **When:** every cycle after 10:00 ET in which the equity or bond sleeve is at least 1 point under its minimum band. Cash is never "filled"; it falls as the other sleeves fill. A sleeve over its maximum is never sold down: purchases into it are refused by the policy's room and it is logged.
+- **What:** core ETFs only. The equity sleeve is filled with the broad equity ETFs of the core list (SPY, QQQ), the bond sleeve with enabled bond ETFs in `REBALANCE_BOND_ETFS` order (default AGG, then SHY; without macro data only SHY, with rising rates the shortest duration first). Never a single stock.
+- **How much:** `REBALANCE_TRANCHE_PCT` of equity per trade (default 5%), at most the sleeve's gap to its minimum, at most one trade a day and `REBALANCE_MAX_TRADES_PER_WEEK` (default 2) per rolling 5 trading days. The order is a market buy with a protective stop (an OTO order, no take-profit) that is at least `MIN_POLICY_STOP_PCT` (default 3%) below the price, or the ATR stop if that is farther: a broad ETF moves 1-2% on a normal day, so a closer stop is hit by noise and the shortfall is then bought again, paying the spread each way (with `MIN_POLICY_STOP_PCT=0` there is no stop and the order is a plain market order). It is sized by the per-trade risk cap (`MAX_RISK_PCT`), the policy's room (real-cash floor, cash band minimum, single-name limit) and spendable cash. A diversified index ETF has its own single-name limit, `IPS_MAX_BROAD_ETF_PCT` (default 20%): at the stock limit of 10% the two core index ETFs could never add more than 20 points of equity, so an equity sleeve far under its floor could not be filled. The equity floor and the bond floor use the same code, tranche, caps and ordering.
+- **What it is exempt from:** the conviction and catalyst requirements, the correlation rule and `MAX_OPEN_POSITIONS`. **What still applies:** the BUY block (circuit breakers, first and last 10 minutes), the re-entry cooldown after a sale, the shared `MAX_TRADES_PER_DAY` / `MAX_TRADES_PER_WEEK` caps, and the minimum holding period on any sell (rebalancing never sells). The tranche is placed before the cycle's discretionary BUYs so they cannot use up the daily cap first.
+- **Logging:** each trade is logged as `[Rebalance] kind=rebalance BUY ...` with the reason, and its `client_order_id` ends in `-rebalance`, which is how the weekly limit is counted from Alpaca's history after a restart. `advisory` logs `would BUY ...` and places nothing.
+- It runs even when Gemini is out of quota or budget.
 
-**Benchmarks.** `/stats` compares the bot with SPY and with a 60/40 SPY/AGG portfolio rebalanced daily, including their max drawdowns and a risk-adjusted ratio.
+The macro regime does not move allocation targets in code: the review's targets are clipped into the bands, and the regime only informs the model's prompt (it is told to lean toward shorter duration and cash when risk is elevated) and gates which bond ETFs may be bought without macro data. Nothing outside the bands is ever targeted.
+
+**Weekly review.** One extra Gemini call on the first eligible cycle on Monday after 10:00 ET sees the whole portfolio and regime and returns target sleeve weights plus at most 2 actions. Targets are clipped into the bands (or rejected if they cannot sum to 100); actions become ordinary decisions that pass every guard, including conviction and a catalyst that is one item of the PORTFOLIO block. Review SELLs are exempt from `MIN_HOLD_DAYS` but count toward the trade caps. The review runs at most once per process per day, and never while Gemini is paused (quota or budget). A band breach no longer triggers a model call: rebalancing is the code above.
+
+**What the review may buy.** Bond ETFs of the sleeve, T-bill cash-parking ETFs (SGOV, BIL) and the core equity ETFs (SPY, QQQ), validated against the IPS (the sleeve must be under its target, band maxima, single-name limits). A review BUY is capped at 5% of equity and never goes past the sleeve target.
+
+**Benchmarks.** `/stats` compares the bot with SPY and with a 60/40 SPY/AGG portfolio rebalanced daily, including their max drawdowns and a risk-adjusted ratio; `/stats/history` adds QQQ and a cash proxy (BIL).
 
 ## Dynamic universe
 
@@ -210,15 +215,15 @@ The filters apply **only to opening new positions**. The bot manages every posit
 
 ## Gemini quota and call volume
 
-- **One call per cycle.** Every symbol due for evaluation (held positions past their cooldown, plus symbols not yet evaluated today) is sent in **one** Gemini call: each symbol's own context block (indicators, rel_volume, the 5 most recent headlines, position state, days held, last action) plus the shared PORTFOLIO / macro regime block once. Structured output (`responseSchema`) makes the reply a JSON array with one object per symbol. Every item is then checked independently by the same guards as before (catalyst quote, `MIN_BUY_CONVICTION`, risk cap, IPS limits, trade caps, `MIN_HOLD_DAYS`, cooldowns): a bad item invalidates only itself, and a symbol the model leaves out is treated as HOLD and logged. The weekly / band-breach review stays a **separate** call (its answer has a different shape and rules; mixing them made the prompt unreliable), so a Monday cycle can use two calls.
+- **One call per cycle.** Every symbol due for evaluation (held positions past their cooldown, plus symbols not yet evaluated today) is sent in **one** Gemini call: each symbol's own context block (indicators, rel_volume, the 5 most recent headlines, position state, days held, last action) plus the shared PORTFOLIO / macro regime block once. Structured output (`responseSchema`) makes the reply a JSON array with one object per symbol. Every item is then checked independently by the same guards as before (catalyst quote, `MIN_BUY_CONVICTION`, risk cap, IPS limits, trade caps, `MIN_HOLD_DAYS`, cooldowns): a bad item invalidates only itself, and a symbol the model leaves out is treated as HOLD and logged. The weekly review stays a **separate** call (its answer has a different shape and rules; mixing them made the prompt unreliable), so a Monday cycle can use two calls.
 - **If the batch call fails** (503 after the client's own retries, or a reply that is not a JSON array) the bot falls back to one call per symbol only when the remaining daily budget is larger than the number of symbols; otherwise it skips the cycle and logs why.
 - **Models.** At startup the bot lists models (`GET /v1beta/models`, no generate quota) and drops any configured model that is missing. A 404, 400 or 403 on a model at runtime removes it for the rest of the process, is never retried and does **not** count as a call; the next model in the chain (`GEMINI_MODEL`, then `GEMINI_FALLBACK_MODEL`) is used.
 - Every request, retries included, passes a global rate limiter (`GEMINI_MAX_RPM`). Only successful (HTTP 200) calls count against the daily budget, which is tracked **per model** (`GEMINI_DAILY_BUDGET`, default 18, replaced by the limit a per-day 429 reports). The cycle summary logs the symbols in the batch, how many were accepted, rejected (with reasons) or missing, the models used and the calls today per model.
 - **429s are classified from the response body** (`error.details`: `QuotaFailure` violations and `RetryInfo`). The log gets one clean line with the quota metric, quota id and limit value, never the raw JSON. A **per-minute** limit is retried after the `RetryInfo` delay (falling back to `Retry-After`). A **per-day** limit is never retried: the primary model is marked spent and calls switch to `GEMINI_FALLBACK_MODEL` for the rest of the day (logged). Only when both models are spent does the bot pause until 00:00 America/Los_Angeles. 500, 503 and empty responses keep their retries, then the fallback model is tried once.
-- **Budget vs quota.** The budget is a local limit and is logged as `budget`, separately from `quota` (Google's limit). When the budget is limited, priority is: 1) held positions, 2) the weekly / band-breach review, 3) core symbols, 4) screener candidates. Each tier stops at a share of the budget (candidates 50%, core 75%, review 90%, held 100%), so the calls that remain are kept for the more important ones; once a tier is out, nothing below it is called that cycle.
-- While paused, no decisions are made, but stops/take-profits keep working because they are server-side bracket orders. The review does not run while Gemini is paused.
+- **Budget vs quota.** The budget is a local limit and is logged as `budget`, separately from `quota` (Google's limit). When the budget is limited, priority is: 1) held positions, 2) the weekly review, 3) core symbols, 4) screener candidates. Each tier stops at a share of the budget (candidates 50%, core 75%, review 90%, held 100%), so the calls that remain are kept for the more important ones; once a tier is out, nothing below it is called that cycle.
+- While paused, no model decisions are made, but stops/take-profits keep working because they are server-side bracket orders, and band rebalancing (plain code) still runs. The weekly review does not run while Gemini is paused.
 - Non-held symbols with RSI between 40 and 60 and no new news are skipped without calling Gemini.
-- **The "calls today" counter is in memory** and resets when the process restarts (Render restarts, deploys), so it can under-count. The 429 responses are the real source of truth for the quota.
+- **The "calls today" counter is in memory** and resets when the process restarts (Render restarts, deploys, a wake-up from sleep). The service sleeps overnight, so it starts fresh every morning: from process start until the **first successful call or the first daily-quota 429** usage is treated as **unknown**, not zero (the log marks the counts as partial and the remaining-budget figure is an upper bound). After that first call the count is trusted. The per-symbol fallback after a failed batch call stays enabled throughout; a 429 and the fallback model are what stop an over-spend, and skipping would leave held positions unreviewed. A mid-day redeploy can therefore under-count until Google answers with a 429. Each cycle logs `Gemini: active model ... | used this cycle ... | remaining budget estimate ...`.
 
 ## Risk controls
 
@@ -231,24 +236,111 @@ All limits are enforced in code and apply to BUYs; SELL and the server-side stop
 - **Bracket orders:** stop-loss at 2x ATR(14) below entry; take-profit at 2x the risk distance unless Gemini proposes one, which must also be >= 2x. A trade with reward:risk below 2 is rejected. Brackets are GTC so the exit legs survive overnight.
 - **Daily loss breaker:** if equity is down 3% or more from the previous close, no new positions until the next session.
 - **Drawdown halt:** if equity is 10% or more below its peak, BUYs halt and a loud `[RISK]` line is logged every cycle until drawdown recovers. The peak is held in memory, seeded from Alpaca's equity history since `TRACK_START_DATE` (so it survives restarts but ignores earlier highs).
-- **Entry buffer:** no new BUY in the first or last 10 minutes of the session (half days respected via Alpaca's calendar).
+- **Entry buffer:** no new BUY in the first `ENTRY_BLACKOUT_OPEN_MIN` or last `ENTRY_BLACKOUT_CLOSE_MIN` minutes of the session (both default to 10; half days respected via Alpaca's calendar). An audit of the first week (`scripts/entry_audit.py`) found no entry in either window, so the defaults were left alone.
+- **Stop distance:** a stock stop is at least `StopATRMultiple` (2) and at least `MIN_STOP_ATR_MULT` ATRs below entry. The ATR is the average true range, never below the average daily range, so the stop clears a normal day's range.
 - **Long-only:** SELL is only honored when a long position exists, and it closes the whole position after cancelling its open bracket legs.
 
-**Review visibility.** Every cycle in which the weekly or band-breach review does not run logs one `[Review] not run: <reason> | cash X% of equity, band lo-hi%` line (not due, before 10:00 ET, already ran today, Gemini paused or out of budget, trade cap reached, market closed, scheduler paused). A review that runs logs its outcome as before.
+**Review visibility.** Every cycle ends with exactly one `[Review]` line, so a quiet cycle is never a silent one:
+
+```
+[Review] ts=2026-10-16 10:15 EDT | regime=risk-off, inverted curve | equities 28.2% (band 40-75%, below min) | bonds 0.0% (band 15-40%, below min) | cash 71.8% (band 5-30%, above max) | mode=gradual | action=rebalance | skip=-
+```
+
+`action` is `none`, or any of `rebalance`, `buy` and `sell` joined with `+`. When it is `none`, `skip` says why (rebalancing deferred because of a cap, a cooldown or a circuit breaker, Gemini paused, market closed, no signal to act on, and so on). The weekly review's own outcome is logged on a separate `[WeeklyReview]` line.
+
+## Live track record
+
+[autotradingbot-kjr0.onrender.com/stats](https://autotradingbot-kjr0.onrender.com/stats): percentages and counts only, from the paper account, benchmarked against SPY, tracking since `TRACK_START_DATE` (default `2026-10-13`). Computed on demand from Alpaca and cached for 5 minutes; the free Render instance may take about a minute to wake up. Before two trading days of data exist, every metric is `null` and `note` is `"insufficient data"`.
+
+<!-- PERFORMANCE:START -->
+### Performance
+
+![Performance, indexed to 100](docs/performance.svg)
+
+![Allocation against policy bands](docs/allocation.svg)
+
+*Method.* Paper trading only. Every line is the daily portfolio value (or benchmark close) indexed to 100 at the last close before the tracking start, taken from Alpaca; the shaded ticks are the bot's daily high-low range. The benchmarks are SPY, QQQ and a 60/40 portfolio of SPY and AGG rebalanced daily, all on the same dates and the same base. Beta is the covariance of the bot's daily returns with SPY's over the variance of SPY's, computed from daily returns and shown only after 30 daily observations; volatility and tracking error (annualised with the square root of 252) need 20, and the Sharpe-like ratio needs 20. Until 10 trading days exist both charts are a placeholder. The allocation chart shows percentages of portfolio value against the policy bands, never amounts. Charts are redrawn after each US close by `scripts/render_chart.py`.
+
+**Paper trading only. Not investment advice.**
+
+*How to read the comparison.* Beating SPY is not the target. The policy requires bonds (15-40%) and cash (5-30%), and a portfolio that is never fully in equities will trail an equity index in a rising market and lead it in a falling one: that is the allocation, not skill or its lack. The fair yardsticks are the **60/40 SPY/AGG** portfolio (a passive mix with a similar split) and **`alloc_matched`**, which gives SPY, AGG and BIL the bot's own weights, so that what remains is selection, core ETFs and trading. `scripts/attribution.py` splits the gap versus SPY into those pieces. The measurement window is also short and starts mid-stream: the turnover and per-trade risk guards were deployed on 2026-10-13 after that day's trades, and the investment policy on 2026-10-14, so the first tracked day reflects the earlier, unguarded code. Treat a handful of trading days as a description, not as evidence. Charts built from sample files carry a visible ILLUSTRATIVE DATA label and are never written to `docs/`.
+<!-- PERFORMANCE:END -->
+
+### Endpoints
+
+`GET /stats` (shape; **placeholder numbers, not real results**):
+
+```json
+{
+  "start_date": "2026-10-13",
+  "days_tracked": 40,
+  "bot_return_pct": 1.84,
+  "spy_return_pct": 2.31,
+  "excess_return_pct": -0.47,
+  "max_drawdown_pct": -2.65,
+  "best_day_pct": 1.12,
+  "worst_day_pct": -1.38,
+  "num_trades": 9,
+  "exits_count": 7,
+  "exits_breakdown": {"stop_loss": 2, "take_profit": 1, "discretionary": 4},
+  "closed_round_trips": 7,
+  "win_rate_pct": 57.14,
+  "open_positions_count": 3,
+  "benchmark_60_40_return_pct": 1.12,
+  "bot_vs_60_40_pct": 0.72,
+  "max_drawdown_spy_pct": -3.4,
+  "max_drawdown_60_40_pct": -1.9,
+  "risk_adjusted": {"bot": 1.31, "spy": 1.05, "benchmark_60_40": 1.22},
+  "observations": 40,
+  "beta_vs_spy": 0.62,
+  "correlation_vs_spy": 0.71,
+  "volatility_ann_pct": 8.4,
+  "tracking_error_vs_spy_pct": 6.1,
+  "allocation_pct": {"equities": 58.2, "bonds": 22.5, "cash": 19.3},
+  "policy_bands_pct": {"equities": {"min": 40, "max": 75}, "bonds": {"min": 15, "max": 40}, "cash": {"min": 5, "max": 30}},
+  "last_updated": "2026-11-10T21:05:00Z",
+  "definitions": {"num_trades": "...", "win_rate_pct": "..."}
+}
+```
+
+- **Returns** are measured from the close before the start date. `max_drawdown_pct` is the worst peak-to-trough decline of the daily value (negative). `benchmark_60_40_return_pct` is 60% SPY / 40% AGG rebalanced daily.
+- **`num_trades`** counts **filled entry orders** (buys) since the start date. **`exits_count`** counts filled exit orders (sells): stop-loss fills, take-profit fills and discretionary sells, split in `exits_breakdown`. Stops and take-profits are therefore never mixed into `num_trades`.
+- **`win_rate_pct`** is the closed round trips with a positive realised result divided by `closed_round_trips`, on average cost. Only positions both opened and closed since the start count (positions already open at the start are not). It is `null` while none has closed.
+- **`risk_adjusted`** is mean daily return over its standard deviation, annualised, no risk-free rate; `"insufficient data"` until 20 trading days exist.
+- **`beta_vs_spy`, `correlation_vs_spy`** come from the daily returns of the bot and SPY and are `null` until 30 observations (`observations` is the count). **`volatility_ann_pct`** and **`tracking_error_vs_spy_pct`** (standard deviation of the daily return difference, annualised) are `null` until 20. Nulls are never filled in.
+- **`allocation_pct`** splits equity into sleeves (cash includes T-bill ETFs); `policy_bands_pct` is each sleeve's allowed range. Each counter is also described in the `definitions` object of the response.
+- No dollar amounts, share counts, held symbols, order ids or account identifiers are ever returned.
+
+`GET /stats/history` is a JSON array, one entry per trading day, `[]` until two trading days exist, cached for 5 minutes:
+
+```json
+[{"date": "2026-10-13", "o": 100.0, "h": 100.4, "l": 99.8, "c": 100.2,
+  "spy": 100.1, "qqq": 100.3, "agg": 100.0, "mix_60_40": 100.0, "cash": 100.0}]
+```
+
+`o`, `h`, `l`, `c` are the daily open, high, low and close of the portfolio value indexed to 100 at the baseline (built from the finest intraday Alpaca history, falling back to close-only with `o=h=l=c`); the other fields are SPY, QQQ, AGG, the 60/40 mix and BIL (a cash proxy) indexed the same way and aligned on the same dates. `alloc_matched` is the bot's own equity / bond / cash weights at each previous close applied to the day's SPY, AGG and BIL returns and chained from 100 (the weights are rebuilt from the current positions by undoing later fills; they never leave the server). A benchmark that cannot be loaded is `null`. CORS is limited to `https://francocaccia.github.io`, `CORS_EXTRA_ORIGIN` if set, and localhost.
 
 ## Deployment
 
-The included `Dockerfile` builds the Go binary on top of a Python image. `render.yaml` deploys it as a Render web service; the bot exposes `/health` so an uptime monitor (UptimeRobot) can keep the free instance awake. Nothing is written to disk. Secrets are set in the Render dashboard, never in the repository.
+The included `Dockerfile` builds the Go binary on top of a Python image. `render.yaml` deploys it as a Render web service. Nothing is written to disk. Secrets are set in the Render dashboard, never in the repository.
+
+**Sleep and wake (Render free tier).** The instance sleeps after 15 minutes without HTTP traffic and a wake-up is a fresh process. Point an uptime monitor at `GET /health` Monday to Friday, 09:00-16:50 America/New_York, every 10 minutes: that covers the whole session and lets the instance sleep overnight and at weekends. `/health` answers from memory and calls no external API, so it is fast and cannot fail because Alpaca, Yahoo or Gemini is down.
+
+- Cycles follow the New York wall clock: at most one per slot, and a process that wakes inside a slot runs one catch-up cycle (only if Alpaca says the market is open). Missed slots are not replayed.
+- Orders are idempotent: the `client_order_id` is `atb-<date>-<symbol>-<side>-<kind>`, and the bot looks at today's orders for the symbol before submitting, so a restart or a repeated cycle cannot place the same order twice. If that lookup fails, no order is sent.
+- Memory that a restart loses (the Gemini call counters, the evaluation gate, the last-decision memory) is treated as unknown rather than zero where that matters; position ages, cooldowns, trade counts and rebalancing counts are rebuilt from Alpaca's order history.
+
+**Charts.** `.github/workflows/chart.yml` runs on weekdays at 21:30 UTC (and on demand). It wakes the service with a `/health` retry loop of up to 90 seconds, runs `scripts/render_chart.py`, and commits `docs/performance.svg` and `docs/allocation.svg` as `github-actions[bot]` only if they changed. If the data cannot be fetched the last good charts stay. Set the repository variable `BOT_URL` to override the default service address.
 
 ## Known limitations
 
 - **Gemini free-tier limits are low.** `gemini-2.5-flash` allows 20 requests per day per project per model as observed in production. Batching (one call per cycle for every due symbol), the cooldown, prefilter, rate limiter, per-model priority-tiered budget and the fallback model keep usage inside that, but both models can still be spent on a busy day; decisions then pause until 00:00 Pacific. Free-tier model availability also changes (`gemini-2.5-flash-lite` was closed to new users), which is why the model names are configurable and checked at startup.
-- **In-memory counters reset on a Render restart:** the Gemini per-model budget counter ("calls today"), the learned per-day limits, the last-decision memory, the evaluation gate and the review-day markers live in memory, so after a restart the bot can over-spend the real daily quota (the 429 responses then stop it) and can repeat one evaluation or review. Position age, cooldowns and trade counts are rebuilt from Alpaca and survive restarts.
-- **Yahoo can fail from cloud IPs:** Yahoo often throttles shared hosting IPs (Render included). Technicals therefore come from Alpaca's free IEX bars, cached 10 minutes; only fundamentals (beta, P/E, sector, average volume) use Yahoo, cached 12 hours, retried with backoff, with the last good average volume kept 24 hours as a fallback. If Yahoo stays down, indicators still work but average volume is unknown: core symbols and bond ETFs are kept anyway (with a WARN), while new screener candidates fail the liquidity filter until fundamentals load (held positions are still evaluated and sold). Data failures for a held position log a WARNING and leave its bracket orders untouched.
+- **In-memory state resets on a Render restart:** the Gemini per-model counters and learned per-day limits (treated as unknown, see above), the last-decision memory, the evaluation gate and the review-day marker live in memory, so after a restart the bot can repeat one evaluation or the weekly review (the 429 responses stop an over-spend). Position age, cooldowns, trade counts and rebalancing counts are rebuilt from Alpaca and survive restarts.
+- **Yahoo can fail from cloud IPs:** Yahoo often throttles shared hosting IPs (Render included). Technicals therefore come from Alpaca's free IEX bars (Yahoo bars are only a fallback), cached 10 minutes; fundamentals (beta, P/E, sector, average volume) and the macro series use Yahoo. Every worker call has a timeout and a retry with backoff; when a refresh still fails the last good value is served with a warning (stale-while-error: prices for up to 30 minutes, the macro series for 24 hours, fundamentals for 72 hours). Yields and the VIX have no Alpaca equivalent, so after the stale window the regime reads as unavailable. If Yahoo stays down, indicators still work but average volume is unknown: core symbols and bond ETFs are kept anyway (with a WARN; a core symbol is only skipped when no source has any price for it), while new screener candidates fail the liquidity filter until fundamentals load (held positions are still evaluated and sold). Data failures for a held position log a WARNING and leave its bracket orders untouched.
 - **LLM conviction is not calibrated**, so the conviction, catalyst and turnover guards are a blunt control until a decision log exists to tune them against outcomes.
 - **Bond ETFs carry rate and credit risk.** They are not cash: long duration loses when rates rise and HYG / EMB fall with equities in a sell-off. The duration and credit caps use a static table of approximate durations.
 - **Paper trading ignores slippage and liquidity reality**: fills are optimistic, so a strategy that looks fine here can be worse live. Low turnover is partly a defence against fooling ourselves.
-- **Tracking started with an existing legacy portfolio**: positions opened before `TRACK_START_DATE` have unknown age (no holding restriction) and are excluded from the win rate, and the allocation bands may start out of range.
+- **Tracking started with an existing legacy portfolio**: positions opened before `TRACK_START_DATE` have unknown age (no holding restriction) and are excluded from the win rate, and the allocation bands may start out of range. Their stops come from the older code and can be tighter than today's rule (the first-week audit found stops of 1.1 to 1.6 ATR on three legacy positions, and one stop 23% away on a very volatile stock); the bot does not rewrite the stops of positions it did not open.
 - Correlation, volatility and beta use 60 daily IEX closes; with fewer than 30 overlapping days they read as unavailable and the correlation rule is not applied.
 - Intraday volume is never sent to the model (the IEX feed shows a small slice of consolidated volume). It sees last completed session volume vs the 60-session average, computed from the same bars.
 - **IEX volume is a partial feed** covering only a fraction of market volume, which is why liquidity uses Yahoo's average volume rather than the bars, and why the model only sees `rel_volume` (last completed session vs the 60-session average of the same bars; omitted when fewer than 60 baseline sessions exist).
