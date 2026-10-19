@@ -139,8 +139,8 @@ type sleeveGap struct {
 //     at most one a day and REBALANCE_MAX_TRADES_PER_WEEK a week;
 //   - the investment policy's room (cash floor, band maximums, single-name
 //     limit), the per-trade risk cap and the shared daily / weekly trade caps;
-//   - the re-entry cooldown after a sale, and the usual BUY block (circuit
-//     breakers, the minutes after the open and before the close).
+//   - the usual BUY block (circuit breakers, the minutes after the open and
+//     before the close). The re-entry cooldown does not apply to a policy tranche.
 //
 // A sleeve above its maximum is never sold down: purchases into it are refused by
 // the policy's room, and it is only logged. The cycle's reasons for not trading
@@ -211,7 +211,7 @@ func (s *Scheduler) planRebalance(cs *cycleState, sess *market.Session) {
 	}
 	p := cs.rebal.plan
 	if mode == bandsAdvisory {
-		msg := fmt.Sprintf("advisory (IPS_BANDS_MODE=advisory), no order placed: would BUY %d %s, %.1f%% of equity: %s", p.qty, p.symbol, p.sizePct, p.reason)
+		msg := fmt.Sprintf("would BUY %d %s, %.1f%% of equity (advisory, not submitted): %s", p.qty, p.symbol, p.sizePct, p.reason)
 		log.Printf("[Rebalance] kind=rebalance %s", msg)
 		cs.why("rebalance " + msg)
 		cs.rebal.plan = nil
@@ -304,12 +304,9 @@ func (s *Scheduler) proposeTranche(cs *cycleState, book portfolio.Book, g sleeve
 	acct := cs.account
 	var notes []string
 	for _, sym := range candidates {
-		if s.cfg.ReentryCooldownDays > 0 {
-			if days, ok := cs.history.SinceLastSell(sym); ok && days < s.cfg.ReentryCooldownDays {
-				notes = append(notes, fmt.Sprintf("%s: re-entry cooldown (sold %d trading day(s) ago, minimum %d)", sym, days, s.cfg.ReentryCooldownDays))
-				continue
-			}
-		}
+		// The re-entry cooldown is for discretionary BUYs. A policy tranche is a
+		// floor being restored by rule, not an idea being re-tried, and the
+		// protective stop is kept wide enough that noise does not trigger it.
 		ind, err := s.rebalanceIndicators(sym)
 		if err != nil || ind == nil || ind.Price <= 0 {
 			notes = append(notes, fmt.Sprintf("%s: no market data", sym))

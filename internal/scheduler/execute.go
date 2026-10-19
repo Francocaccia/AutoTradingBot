@@ -245,6 +245,12 @@ func (s *Scheduler) executeDecisions(cs *cycleState) {
 	// otherwise use up the shared daily cap first.
 	s.execRebalance(cs)
 	for _, p := range buys {
+		// A BUY that came from the weekly review is policy-driven: in advisory mode
+		// it is only reported, never submitted, and it takes no trade cap.
+		if p.fromReview && s.bandsMode() == bandsAdvisory {
+			s.adviseBuy(p, cs)
+			continue
+		}
 		s.execBuy(p, cs)
 	}
 }
@@ -413,7 +419,7 @@ func (s *Scheduler) placeBuy(p pendingDecision, cs *cycleState) bool {
 	if err := s.orders.PlaceBracketOrder(symbol, qty, broker.Buy, levels.Stop, levels.Take, broker.KindEntry); err != nil {
 		return s.orderFailed(cs, symbol, "BUY", "BUY (bracket)", err)
 	}
-	log.Printf("[%s] BUY %d shares @ ~$%.2f (bracket stop=%.2f take=%.2f R:R=%.1f)", symbol, qty, ind.Price, levels.Stop, levels.Take, levels.RewardRisk)
+	s.logBuy(symbol, fmt.Sprintf("%d shares @ ~$%.2f (bracket stop=%.2f take=%.2f R:R=%.1f)", qty, ind.Price, levels.Stop, levels.Take, levels.RewardRisk))
 	s.recordBuy(cs, symbol, position, qty, ind.Price)
 	return true
 }
@@ -500,30 +506,44 @@ func (s *Scheduler) placeBondBuy(p pendingDecision, cs *cycleState) bool {
 		if err := s.orders.PlaceMarketOrder(sym, qty, broker.Buy, broker.KindEntry); err != nil {
 			return s.orderFailed(cs, sym, "BUY", "BUY", err)
 		}
-		log.Printf("[%s] BUY %d shares @ ~$%.2f (cash-like ETF, no bracket, %.1f%% of equity)", sym, qty, ind.Price, float64(qty)*ind.Price/acct.Equity*100)
+		s.logBuy(sym, fmt.Sprintf("%d shares @ ~$%.2f (cash-like ETF, no bracket, %.1f%% of equity)", qty, ind.Price, float64(qty)*ind.Price/acct.Equity*100))
 		s.recordBuy(cs, sym, cs.positions[sym], qty, ind.Price)
 		return true
 	}
 
-	stop, err := risk.StopBelow(ind.Price, ind.ATR, risk.BondStopATRMultiple)
+	// A bond ETF moves a fraction of a percent a day, so a plain ATR stop sits
+	// inside ordinary noise: the stop is at least MIN_POLICY_STOP_PCT away (or
+	// there is none), as for the policy rebalancing trades.
+	stop, err := s.policyStop(ind.Price, ind.ATR, risk.BondStopATRMultiple)
 	if err != nil {
 		cs.drop(sym, "BUY", "bracket", fmt.Sprintf("rejected: %v", err))
 		return false
 	}
-	if capped, stopPct := risk.CapQtyByRisk(qty, ind.Price, stop, acct.Equity, s.cfg.MaxRiskPct); capped < qty {
-		if capped < 1 {
-			cs.drop(sym, "BUY", "risk-cap", fmt.Sprintf("max-risk %.2f%% of equity allows less than 1 share (stop %.1f%% away)", s.cfg.MaxRiskPct, stopPct))
-			return false
+	if stop > 0 {
+		if capped, stopPct := risk.CapQtyByRisk(qty, ind.Price, stop, acct.Equity, s.cfg.MaxRiskPct); capped < qty {
+			if capped < 1 {
+				cs.drop(sym, "BUY", "risk-cap", fmt.Sprintf("max-risk %.2f%% of equity allows less than 1 share (stop %.1f%% away)", s.cfg.MaxRiskPct, stopPct))
+				return false
+			}
+			log.Printf("[%s] BUY qty capped: requested %d, capped %d, risk $%.2f of $%.2f allowed (max-risk %.2f%%, stop %.1f%% away)",
+				sym, qty, capped, float64(capped)*(ind.Price-stop), acct.Equity*s.cfg.MaxRiskPct/100, s.cfg.MaxRiskPct, stopPct)
+			qty = capped
 		}
-		log.Printf("[%s] BUY qty capped: requested %d, capped %d, risk $%.2f of $%.2f allowed (max-risk %.2f%%, stop %.1f%% away)",
-			sym, qty, capped, float64(capped)*(ind.Price-stop), acct.Equity*s.cfg.MaxRiskPct/100, s.cfg.MaxRiskPct, stopPct)
-		qty = capped
 	}
-	if err := s.orders.PlaceOTOOrder(sym, qty, broker.Buy, stop, broker.KindEntry); err != nil {
-		return s.orderFailed(cs, sym, "BUY", "BUY (stop-only)", err)
+	if stop > 0 {
+		err = s.orders.PlaceOTOOrder(sym, qty, broker.Buy, stop, broker.KindEntry)
+	} else {
+		err = s.orders.PlaceMarketOrder(sym, qty, broker.Buy, broker.KindEntry)
 	}
-	log.Printf("[%s] BUY %d shares @ ~$%.2f (bond ETF, %.0fx ATR stop=%.2f, no take-profit, %.1f%% of equity)",
-		sym, qty, ind.Price, risk.BondStopATRMultiple, stop, float64(qty)*ind.Price/acct.Equity*100)
+	if err != nil {
+		return s.orderFailed(cs, sym, "BUY", "BUY (bond ETF)", err)
+	}
+	stopText := "no stop"
+	if stop > 0 {
+		stopText = fmt.Sprintf("stop=%.2f, %.1f%% below", stop, (ind.Price-stop)/ind.Price*100)
+	}
+	s.logBuy(sym, fmt.Sprintf("%d shares @ ~$%.2f (bond ETF, %s, no take-profit, %.1f%% of equity)",
+		qty, ind.Price, stopText, float64(qty)*ind.Price/acct.Equity*100))
 	s.recordBuy(cs, sym, cs.positions[sym], qty, ind.Price)
 	return true
 }

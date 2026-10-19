@@ -168,8 +168,9 @@ func TestBondBuyIsSizedTowardTheSleeveTargetWithAWiderStop(t *testing.T) {
 	if !ok || ord.qty != 50 || ord.kind != "oto" {
 		t.Fatalf("order = %+v ok=%v, want 50 shares as a stop-only (oto) order", ord, ok)
 	}
-	if ord.stop != 98.5 { // 100 - 3 x 0.5 ATR
-		t.Errorf("stop = %v, want 98.5 (3x ATR)", ord.stop)
+	// 3 x 0.5 ATR would be 98.5, inside a normal day's noise: the stop is pushed out to 3%.
+	if ord.stop != 97 {
+		t.Errorf("stop = %v, want 97 (at least MIN_POLICY_STOP_PCT below)", ord.stop)
 	}
 	if cs.positions["SHY"] == nil {
 		t.Error("the cycle's positions must reflect the purchase")

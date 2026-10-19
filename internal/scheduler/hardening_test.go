@@ -72,15 +72,16 @@ func TestPolicyTradeWithoutAStopIsAPlainMarketOrder(t *testing.T) {
 	}
 }
 
-// A policy stop and re-buy cannot loop on noise: after the stop fills, the
-// re-entry cooldown holds the symbol back and the next ETF in line is used.
-func TestStoppedPolicyETFIsNotBoughtBackInTheCooldown(t *testing.T) {
+// The policy tranche is exempt from the re-entry cooldown; what keeps it from a
+// stop-and-rebuy loop is the stop distance (at least 3%), not a waiting period.
+func TestStoppedPolicyETFMayBeBoughtBackBecauseItsStopIsWide(t *testing.T) {
 	s, o := policyScheduler("gradual")
+	s.fetchBond = func(string) (*indicators.Result, error) { return calmETF(), nil }
 	stopped := fill("AGG", "sell", "stop", "2026-10-14 10:00", 50)
 	cs := policyCycle(s, 72_000, map[string]float64{"AAPL": 28_000}, stopped)
 	runPolicy(s, cs)
-	if len(o.placed) != 1 || o.placed[0].symbol == "AGG" {
-		t.Errorf("AGG was stopped out yesterday: %+v", o.placed)
+	if len(o.placed) != 1 || o.placed[0].symbol != "AGG" || 100-o.placed[0].stop < 3-1e-9 {
+		t.Errorf("orders = %+v", o.placed)
 	}
 }
 

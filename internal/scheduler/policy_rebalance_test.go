@@ -310,23 +310,35 @@ func TestRebalanceRespectsCashFloorAndMaxRisk(t *testing.T) {
 	}
 }
 
-func TestRebalanceKeepsTheReentryCooldown(t *testing.T) {
+// A policy tranche restores a floor by rule; it is not an idea being re-tried, so
+// the re-entry cooldown (which stops discretionary churn) does not apply to it.
+func TestPolicyRebalanceIsExemptFromTheReentryCooldown(t *testing.T) {
 	s, o := policyScheduler("gradual")
 	sold := fill("AGG", "sell", "market", "2026-10-14 10:30", 10) // sold yesterday: 1 trading day ago
 	cs := policyCycle(s, 72_000, map[string]float64{"AAPL": 28_000}, sold)
 	runPolicy(s, cs)
-	// AGG is in cooldown, so the next bond ETF in the list is used.
-	if len(o.placed) != 1 || o.placed[0].symbol != "SHY" {
-		t.Fatalf("orders %+v (%v)", o.placed, cs.whyNot)
+	if len(o.placed) != 1 || o.placed[0].symbol != "AGG" || o.placed[0].orderKind != broker.KindRebalance {
+		t.Fatalf("a sold ETF is still the first candidate for the floor: %+v (%v)", o.placed, cs.whyNot)
 	}
 
-	// Every bond candidate in cooldown and no other sleeve short: no trade, with the reason.
+	// Every bond candidate sold yesterday: the floor is still filled.
 	s, o = policyScheduler("gradual")
 	cs = policyCycle(s, 45_000, map[string]float64{"SPY": 55_000},
 		fill("AGG", "sell", "market", "2026-10-14 10:30", 10), fill("SHY", "sell", "market", "2026-10-14 10:35", 10))
 	runPolicy(s, cs)
-	if len(o.placed) != 0 || !strings.Contains(strings.Join(cs.whyNot, ";"), "re-entry cooldown") {
+	if len(o.placed) != 1 || strings.Contains(strings.Join(cs.whyNot, ";"), "cooldown") {
 		t.Errorf("orders %+v why %v", o.placed, cs.whyNot)
+	}
+}
+
+// The cooldown stays for discretionary BUYs of the same symbol, bond ETFs included.
+func TestDiscretionaryBuyKeepsTheReentryCooldown(t *testing.T) {
+	s, o := policyScheduler("gradual")
+	cs := policyCycle(s, 72_000, map[string]float64{"AAPL": 28_000}, fill("SHY", "sell", "market", "2026-10-14 10:30", 10))
+	cs.pending = []pendingDecision{bondBuy("SHY", "VIX: 27.3")}
+	s.executeDecisions(cs)
+	if _, ok := o.order("SHY"); ok || cs.dropReasons["cooldown"] != 1 {
+		t.Errorf("a discretionary re-buy inside the cooldown: %+v %v", o.placed, cs.dropReasons)
 	}
 }
 
@@ -374,7 +386,7 @@ func TestAdvisoryModeLogsWhatItWouldDoAndPlacesNothing(t *testing.T) {
 	if len(o.placed) != 0 || cs.rebal.plan != nil || len(cs.did) != 0 {
 		t.Errorf("advisory placed something: %+v %v", o.placed, cs.did)
 	}
-	if !strings.Contains(logs.String(), "advisory (IPS_BANDS_MODE=advisory), no order placed: would BUY 50 AGG") {
+	if !strings.Contains(logs.String(), "would BUY 50 AGG, 5.0% of equity (advisory, not submitted)") {
 		t.Errorf("the intended trade is not logged:\n%s", logs)
 	}
 	if line := s.reviewLine(cs, session("2026-10-15", "11:00")); !strings.Contains(line, "mode=advisory") || !strings.Contains(line, "would BUY 50 AGG") || !strings.Contains(line, "action=none") {

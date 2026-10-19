@@ -181,6 +181,7 @@ type Scheduler struct {
 	skipDay   string    // ET date on which the market is closed for good: no more slots are tried
 	newsAt    time.Time // when the news cache was last refreshed
 	fetchNews func()    // reloads s.newsCache (fetchAndCacheNews; replaced in tests)
+	dry       bool      // an advisory dry run is in progress: logs say "would BUY" (see advisory.go)
 	slotsRun  int
 }
 
