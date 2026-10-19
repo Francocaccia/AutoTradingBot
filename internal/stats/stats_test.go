@@ -60,6 +60,15 @@ func TestAlignUsesPriorCloseAsBaseline(t *testing.T) {
 
 type fakeSource struct {
 	equity, spy, agg []Point
+	qqq, bil         []Point
+	intraday         []Sample
+	intradayErr      error
+	intradayCalls    int
+	intradayRange    [2]string
+	weights          map[string]Allocation
+	defaultWeights   Allocation
+	weightsErr       error
+	weightCalls      int
 	orders           []Order
 	open             int
 	alloc            Allocation
@@ -69,11 +78,36 @@ type fakeSource struct {
 }
 
 func (f *fakeSource) EquityHistory(int) ([]Point, error) { f.calls++; return f.equity, f.err }
+func (f *fakeSource) IntradayEquity(start, end string) ([]Sample, error) {
+	f.intradayCalls++
+	f.intradayRange = [2]string{start, end}
+	return f.intraday, f.intradayErr
+}
 func (f *fakeSource) Closes(symbol, _ string) ([]Point, error) {
-	if symbol == "AGG" {
+	switch symbol {
+	case "AGG":
 		return f.agg, f.err
+	case "QQQ":
+		return f.qqq, f.err
+	case "BIL":
+		return f.bil, f.err
 	}
 	return f.spy, f.err
+}
+func (f *fakeSource) SleeveWeights(_ []Point, dates []string) (map[string]Allocation, error) {
+	f.weightCalls++
+	if f.weightsErr != nil {
+		return nil, f.weightsErr
+	}
+	out := map[string]Allocation{}
+	for _, d := range dates {
+		w, ok := f.weights[d]
+		if !ok {
+			w = f.defaultWeights
+		}
+		out[d] = w
+	}
+	return out, nil
 }
 func (f *fakeSource) Allocation() (Allocation, error)      { return f.alloc, f.allocErr }
 func (f *fakeSource) FilledOrders(string) ([]Order, error) { return f.orders, f.err }
@@ -86,8 +120,8 @@ func newFake() *fakeSource {
 		agg:    []Point{{"2026-10-12", 100}, {"2026-10-13", 101}, {"2026-10-14", 100}},
 		alloc:  Allocation{Equities: 55.555, Bonds: 25, Cash: 19.445},
 		orders: []Order{
-			{Symbol: "ZZTOP", Side: "buy", Qty: 777, Price: 31.37, FilledAt: time.Now()},
-			{Symbol: "ZZTOP", Side: "sell", Qty: 777, Price: 40.11, FilledAt: time.Now()},
+			{Symbol: "ZZTOP", Side: "buy", Type: "market", Qty: 777, Price: 31.37, FilledAt: time.Now()},
+			{Symbol: "ZZTOP", Side: "sell", Type: "market", Qty: 777, Price: 40.11, FilledAt: time.Now()},
 		},
 		open: 3,
 	}
@@ -111,6 +145,9 @@ func TestResponseHasOnlyAllowedFieldsAndNoPrivateValues(t *testing.T) {
 		"num_trades": true, "win_rate_pct": true, "open_positions_count": true, "last_updated": true,
 		"benchmark_60_40_return_pct": true, "bot_vs_60_40_pct": true, "max_drawdown_spy_pct": true,
 		"max_drawdown_60_40_pct": true, "risk_adjusted": true, "allocation_pct": true,
+		"policy_bands_pct": true, "observations": true, "beta_vs_spy": true, "correlation_vs_spy": true,
+		"volatility_ann_pct": true, "tracking_error_vs_spy_pct": true, "exits_count": true,
+		"exits_breakdown": true, "closed_round_trips": true, "definitions": true,
 	}
 	var m map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
@@ -132,7 +169,7 @@ func TestResponseHasOnlyAllowedFieldsAndNoPrivateValues(t *testing.T) {
 		}
 	}
 	// 100%-baseline checks: bot 123456.78 -> 122000 = -1.18%, SPY 500 -> 510 = +2%.
-	if !near(m["bot_return_pct"].(float64), -1.18) || !near(m["spy_return_pct"].(float64), 2) || m["num_trades"].(float64) != 2 || m["win_rate_pct"].(float64) != 100 {
+	if !near(m["bot_return_pct"].(float64), -1.18) || !near(m["spy_return_pct"].(float64), 2) || m["num_trades"].(float64) != 1 || m["exits_count"].(float64) != 1 || m["win_rate_pct"].(float64) != 100 {
 		t.Errorf("values = %v", m)
 	}
 }

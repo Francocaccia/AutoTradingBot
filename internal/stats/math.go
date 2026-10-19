@@ -83,3 +83,70 @@ func ratio(values []float64) *float64 {
 	}
 	return ptr(round2(mean / sd * math.Sqrt(252)))
 }
+
+// stdev is the sample standard deviation (n-1); 0 for fewer than two values.
+func stdev(xs []float64) float64 {
+	if len(xs) < 2 {
+		return 0
+	}
+	var sum float64
+	for _, x := range xs {
+		sum += x
+	}
+	mean := sum / float64(len(xs))
+	var ss float64
+	for _, x := range xs {
+		ss += (x - mean) * (x - mean)
+	}
+	return math.Sqrt(ss / float64(len(xs)-1))
+}
+
+// annualise scales a daily standard deviation to a yearly one (252 sessions).
+func annualise(daily float64) float64 { return daily * math.Sqrt(252) }
+
+// betaCorr returns the beta of a to market and their correlation, from two
+// equally long daily-return series. ok is false when the series are shorter
+// than two values or the market (or a) does not vary.
+func betaCorr(a, market []float64) (beta, corr float64, ok bool) {
+	if len(a) != len(market) || len(a) < 2 {
+		return 0, 0, false
+	}
+	var sa, sm float64
+	for i := range a {
+		sa += a[i]
+		sm += market[i]
+	}
+	ma, mm := sa/float64(len(a)), sm/float64(len(a))
+	var cov, va, vm float64
+	for i := range a {
+		cov += (a[i] - ma) * (market[i] - mm)
+		va += (a[i] - ma) * (a[i] - ma)
+		vm += (market[i] - mm) * (market[i] - mm)
+	}
+	if va == 0 || vm == 0 {
+		return 0, 0, false
+	}
+	return cov / vm, cov / math.Sqrt(va*vm), true
+}
+
+// activeReturns is the per-day difference between two return series of equal length.
+func activeReturns(a, b []float64) []float64 {
+	out := make([]float64, 0, len(a))
+	for i := range a {
+		out = append(out, a[i]-b[i])
+	}
+	return out
+}
+
+// indexTo100 rescales values so the first one is 100. A non-positive first
+// value yields nil: there is no meaningful base.
+func indexTo100(values []float64) []float64 {
+	if len(values) == 0 || values[0] <= 0 {
+		return nil
+	}
+	out := make([]float64, len(values))
+	for i, v := range values {
+		out[i] = v / values[0] * 100
+	}
+	return out
+}

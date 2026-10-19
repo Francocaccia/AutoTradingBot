@@ -45,6 +45,67 @@ func (a AlpacaSource) EquityHistory(days int) ([]Point, error) {
 	return dedupe(out), nil
 }
 
+// intradayChunkDays is the calendar span of one intraday request: Alpaca only
+// serves 1-minute points for ranges of at most seven days.
+const intradayChunkDays = 5
+
+// IntradayEquity returns 1-minute equity samples (market hours) for the ET
+// dates from start to end, inclusive, one request per week. Weeks that fail
+// are skipped; an error is returned only when nothing could be loaded.
+func (a AlpacaSource) IntradayEquity(start, end string) ([]Sample, error) {
+	from, err := time.ParseInLocation("2006-01-02", start, newYork)
+	if err != nil {
+		return nil, err
+	}
+	to, err := time.ParseInLocation("2006-01-02", end, newYork)
+	if err != nil {
+		return nil, err
+	}
+	var out []Sample
+	var firstErr error
+	for d := from; !d.After(to); d = d.AddDate(0, 0, intradayChunkDays+1) {
+		chunkEnd := d.AddDate(0, 0, intradayChunkDays)
+		if chunkEnd.After(to) {
+			chunkEnd = to
+		}
+		data, err := a.Broker.GetPortfolioHistoryRange("1Min", d.Format("2006-01-02"), chunkEnd.Format("2006-01-02"))
+		if err == nil {
+			var pts []Sample
+			if pts, err = parseHistorySamples(data); err == nil {
+				out = append(out, pts...)
+				continue
+			}
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if len(out) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
+// parseHistorySamples reads a portfolio-history payload into samples, skipping
+// missing or non-positive values.
+func parseHistorySamples(data []byte) ([]Sample, error) {
+	var h struct {
+		Timestamp []int64    `json:"timestamp"`
+		Equity    []*float64 `json:"equity"`
+	}
+	if err := json.Unmarshal(data, &h); err != nil {
+		return nil, err
+	}
+	out := make([]Sample, 0, len(h.Timestamp))
+	for i, ts := range h.Timestamp {
+		if i >= len(h.Equity) || h.Equity[i] == nil || *h.Equity[i] <= 0 {
+			continue
+		}
+		out = append(out, Sample{At: time.Unix(ts, 0), Value: *h.Equity[i]})
+	}
+	return out, nil
+}
+
 // Closes returns daily closes of symbol (SPY, AGG) from start (YYYY-MM-DD) onward.
 func (a AlpacaSource) Closes(symbol, start string) ([]Point, error) {
 	bars, err := a.MarketData.DailyBars(symbol, start)
@@ -118,6 +179,7 @@ func (a AlpacaSource) FilledOrders(start string) ([]Order, error) {
 			ID             string  `json:"id"`
 			Symbol         string  `json:"symbol"`
 			Side           string  `json:"side"`
+			Type           string  `json:"type"`
 			Status         string  `json:"status"`
 			FilledQty      string  `json:"filled_qty"`
 			FilledAvgPrice *string `json:"filled_avg_price"`
@@ -141,7 +203,7 @@ func (a AlpacaSource) FilledOrders(start string) ([]Order, error) {
 			if err != nil || qty <= 0 || price <= 0 {
 				continue
 			}
-			out = append(out, Order{Symbol: r.Symbol, Side: r.Side, Qty: qty, Price: price, FilledAt: at})
+			out = append(out, Order{Symbol: r.Symbol, Side: r.Side, Type: r.Type, Qty: qty, Price: price, FilledAt: at})
 		}
 		if len(raw) < 500 {
 			break

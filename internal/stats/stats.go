@@ -1,7 +1,7 @@
 // Package stats computes the bot's public track record on demand from Alpaca
-// (account equity history, filled orders, SPY bars). Nothing is persisted:
-// the response carries percentages and counts only, never dollar amounts,
-// symbols, quantities or account identifiers.
+// (account equity history, filled orders, benchmark bars). Nothing is
+// persisted: the responses carry percentages, indexed values and counts only,
+// never dollar amounts, symbols, quantities, order ids or account identifiers.
 package stats
 
 import (
@@ -23,7 +23,11 @@ const (
 	errorTTL       = 30 * time.Second
 	minTrackedDays = 2
 	minRatioDays   = 20
-	insufficient   = "insufficient data"
+	// minVolDays is the fewest daily return observations before volatility and
+	// tracking error are reported; minBetaDays the same for beta and correlation.
+	minVolDays   = 20
+	minBetaDays  = 30
+	insufficient = "insufficient data"
 )
 
 var (
@@ -45,14 +49,46 @@ type Point struct {
 	Value float64
 }
 
+// Sample is one intraday equity reading.
+type Sample struct {
+	At    time.Time
+	Value float64
+}
+
+// Kind classifies a filled order for the public counters.
+type Kind string
+
+const (
+	KindEntry      Kind = "entry"       // a buy: opens or adds to a long position
+	KindStop       Kind = "stop"        // a sell filled by a stop-loss leg
+	KindTakeProfit Kind = "take_profit" // a sell filled by a take-profit (limit) leg
+	KindExit       Kind = "exit"        // any other sell (a decision to close, a manual sale)
+)
+
 // Order is a filled order; it is used for counting and win/loss only and is
 // never serialised.
 type Order struct {
 	Symbol   string
 	Side     string // "buy" or "sell"
+	Type     string // order type: market, limit, stop, ...
 	Qty      float64
 	Price    float64
 	FilledAt time.Time
+}
+
+// Classify says what kind of order o was. The bot is long-only: every buy is
+// an entry and every sell an exit, told apart by the order type.
+func (o Order) Classify() Kind {
+	if o.Side == "buy" {
+		return KindEntry
+	}
+	switch o.Type {
+	case "stop", "stop_limit", "trailing_stop":
+		return KindStop
+	case "limit":
+		return KindTakeProfit
+	}
+	return KindExit
 }
 
 // Allocation is the portfolio split by sleeve, as % of equity. Percentages
@@ -63,15 +99,41 @@ type Allocation struct {
 	Cash     float64 `json:"cash"`
 }
 
+// Band is one sleeve's policy range, % of equity.
+type Band struct {
+	Min float64 `json:"min"`
+	Max float64 `json:"max"`
+}
+
+// Bands are the policy bands of the three sleeves.
+type Bands struct {
+	Equities Band `json:"equities"`
+	Bonds    Band `json:"bonds"`
+	Cash     Band `json:"cash"`
+}
+
 // Source supplies the raw data. AlpacaSource is the production implementation.
 type Source interface {
 	EquityHistory(days int) ([]Point, error)
+	// IntradayEquity returns intraday equity samples for the ET dates from start
+	// to end (YYYY-MM-DD, inclusive). It may return fewer days than asked for.
+	IntradayEquity(start, end string) ([]Sample, error)
 	// Closes returns daily closes of a benchmark symbol (SPY, AGG) from start.
 	Closes(symbol, start string) ([]Point, error)
 	FilledOrders(start string) ([]Order, error)
 	OpenPositions() (int, error)
 	// Allocation returns the current sleeve split in percent of equity.
 	Allocation() (Allocation, error)
+	// SleeveWeights returns the equity / bond / cash weights (percent) at the close
+	// of each date, given the account value at each close.
+	SleeveWeights(equity []Point, dates []string) (map[string]Allocation, error)
+}
+
+// ExitsBreakdown splits exits_count by how the position was closed.
+type ExitsBreakdown struct {
+	StopLoss      int `json:"stop_loss"`
+	TakeProfit    int `json:"take_profit"`
+	Discretionary int `json:"discretionary"`
 }
 
 // Stats is the public /stats payload. Pointer fields serialise as null when
@@ -92,24 +154,67 @@ type Stats struct {
 	MaxDrawdown6040 *float64    `json:"max_drawdown_60_40_pct"`
 	RiskAdjusted    any         `json:"risk_adjusted"`  // Ratios once minRatioDays exist, else "insufficient data"
 	AllocationPct   *Allocation `json:"allocation_pct"` // by sleeve, percent of equity
-	NumTrades       *int        `json:"num_trades"`
-	WinRatePct      *float64    `json:"win_rate_pct"`
-	OpenPositions   *int        `json:"open_positions_count"`
-	LastUpdated     string      `json:"last_updated"`
-	Note            string      `json:"note,omitempty"`
+	PolicyBands     *Bands      `json:"policy_bands_pct"`
+
+	// Market-relative risk, from the daily returns of the bot and SPY. Each is
+	// null until its minimum number of observations exists.
+	Observations       int      `json:"observations"` // daily return observations used
+	BetaVsSPY          *float64 `json:"beta_vs_spy"`
+	CorrelationVsSPY   *float64 `json:"correlation_vs_spy"`
+	VolatilityAnnPct   *float64 `json:"volatility_ann_pct"`
+	TrackingErrorVsSPY *float64 `json:"tracking_error_vs_spy_pct"` // annualised, percentage points
+
+	NumTrades        *int            `json:"num_trades"`  // filled entry (buy) orders
+	ExitsCount       *int            `json:"exits_count"` // filled exit (sell) orders of every kind
+	ExitsBreakdown   *ExitsBreakdown `json:"exits_breakdown"`
+	ClosedRoundTrips *int            `json:"closed_round_trips"` // the denominator of win_rate_pct
+	WinRatePct       *float64        `json:"win_rate_pct"`
+	OpenPositions    *int            `json:"open_positions_count"`
+
+	LastUpdated string            `json:"last_updated"`
+	Note        string            `json:"note,omitempty"`
+	Definitions map[string]string `json:"definitions"`
 }
 
-// Service computes and caches Stats, and tracks the in-memory equity peak
-// used by the drawdown halt.
+// definitions documents every counter that could be misread. It carries no
+// numbers, only wording.
+var definitions = map[string]string{
+	"num_trades":                 "Filled entry orders (buys) since start_date. Stop-loss, take-profit and other sells are not counted here; see exits_count.",
+	"exits_count":                "Filled exit orders (sells) since start_date: stop-loss fills, take-profit fills and discretionary sells. exits_breakdown splits them.",
+	"closed_round_trips":         "Positions opened and fully closed since start_date, on average cost. Positions that were already open at the start are not counted.",
+	"win_rate_pct":               "Closed round trips with a positive realised result divided by closed_round_trips, in percent. null while none has closed.",
+	"bot_return_pct":             "Change of the daily portfolio value from the last close before start_date to the latest value, in percent.",
+	"max_drawdown_pct":           "Largest peak-to-trough fall of the daily portfolio value since the baseline, in percent (negative).",
+	"benchmark_60_40_return_pct": "60% SPY and 40% AGG, rebalanced daily, over the same dates as the bot.",
+	"beta_vs_spy":                "Covariance of daily bot and SPY returns over the variance of daily SPY returns. null below 30 observations.",
+	"correlation_vs_spy":         "Correlation of daily bot and SPY returns. null below 30 observations.",
+	"volatility_ann_pct":         "Standard deviation of daily bot returns times the square root of 252, in percent. null below 20 observations.",
+	"tracking_error_vs_spy_pct":  "Standard deviation of the daily return difference between the bot and SPY times the square root of 252, in percentage points. null below 20 observations.",
+	"risk_adjusted":              "Mean daily return over its standard deviation, annualised, no risk-free rate. \"insufficient data\" below 20 observations.",
+	"policy_bands_pct":           "Allowed range of each sleeve (equities, bonds, cash including T-bill ETFs) in percent of portfolio value.",
+}
+
+// Service computes and caches Stats and History, and tracks the in-memory
+// equity peak used by the drawdown halt.
 type Service struct {
 	src   Source
 	start string
 	now   func() time.Time
+	bands *Bands
 
 	mu       sync.Mutex
 	cached   *Stats
 	cachedAt time.Time
 	failedAt time.Time
+
+	histMu       sync.Mutex
+	hist         []HistoryDay
+	histAt       time.Time
+	histFailedAt time.Time
+	days         map[string]ohlc       // completed sessions' intraday range, kept for the life of the process
+	weights      map[string]Allocation // sleeve weights at a finished close, kept for the life of the process
+
+	allowOrigin func(origin string) bool
 
 	peakMu     sync.Mutex
 	peak       float64
@@ -123,8 +228,14 @@ func New(src Source, start string) *Service {
 		log.Printf("[Stats] invalid TRACK_START_DATE %q, using %s", start, DefaultStartDate)
 		start = DefaultStartDate
 	}
-	return &Service{src: src, start: start, now: time.Now}
+	return &Service{src: src, start: start, now: time.Now, days: map[string]ohlc{}, weights: map[string]Allocation{}, allowOrigin: OriginPolicy("")}
 }
+
+// SetBands publishes the policy bands in /stats (percentages only).
+func (s *Service) SetBands(b Bands) { s.bands = &b }
+
+// SetOriginPolicy sets which browser origins may read /stats/history.
+func (s *Service) SetOriginPolicy(allow func(origin string) bool) { s.allowOrigin = allow }
 
 // Get returns the stats, recomputing at most once per cacheTTL. After a
 // failure it fails fast for errorTTL so an outage cannot be amplified by
@@ -179,8 +290,8 @@ func (s *Service) historyDays(now time.Time) int {
 	return max(int(now.Sub(start).Hours()/24)+10, 10)
 }
 
-// lookbackStart is where to start fetching SPY bars: early enough to include
-// the session before the start date even across a long weekend or holiday.
+// lookbackStart is where to start fetching benchmark bars: early enough to
+// include the session before the start date even across a long weekend or holiday.
 func (s *Service) lookbackStart() string {
 	t, _ := time.Parse("2006-01-02", s.start)
 	return t.AddDate(0, 0, -10).Format("2006-01-02")
@@ -194,8 +305,17 @@ type Ratios struct {
 	Bench6040 *float64 `json:"benchmark_60_40"`
 }
 
+// tracked is the bot and its SPY / AGG benchmarks on a common set of dates.
+// Index 0 of every slice is the baseline (the last close before the start
+// date); dates[i] belongs to index i+1.
+type tracked struct {
+	dates         []string
+	bot, spy, agg []float64
+}
+
 func (s *Service) compute(now time.Time) (Stats, error) {
-	out := Stats{StartDate: s.start, LastUpdated: now.UTC().Format(time.RFC3339), RiskAdjusted: insufficient}
+	out := Stats{StartDate: s.start, LastUpdated: now.UTC().Format(time.RFC3339), RiskAdjusted: insufficient,
+		PolicyBands: s.bands, Definitions: definitions}
 
 	equity, err := s.src.EquityHistory(s.historyDays(now))
 	if err != nil {
@@ -210,7 +330,7 @@ func (s *Service) compute(now time.Time) (Stats, error) {
 		return Stats{}, err
 	}
 	botVals, benchVals, dates := alignAll(equity, [][]Point{spy, agg}, s.start)
-	out.DaysTracked = len(dates)
+	out.DaysTracked, out.Observations = len(dates), len(dates)
 	if out.DaysTracked < minTrackedDays {
 		out.Note = insufficient
 		return out, nil
@@ -220,7 +340,8 @@ func (s *Service) compute(now time.Time) (Stats, error) {
 
 	last := len(botVals) - 1
 	bot, bench, mixRet := pctChange(botVals[last], botVals[0]), pctChange(spyVals[last], spyVals[0]), pctChange(mix[last], mix[0])
-	worst, best := minMax(dailyReturns(botVals))
+	botRets, spyRets := dailyReturns(botVals), dailyReturns(spyVals)
+	worst, best := minMax(botRets)
 	out.BotReturnPct, out.SPYReturnPct = ptr(round2(bot)), ptr(round2(bench))
 	out.ExcessPct = ptr(round2(bot - bench))
 	out.Bench6040Pct, out.BotVs6040Pct = ptr(round2(mixRet)), ptr(round2(bot-mixRet))
@@ -230,13 +351,26 @@ func (s *Service) compute(now time.Time) (Stats, error) {
 	if out.DaysTracked >= minRatioDays {
 		out.RiskAdjusted = Ratios{Bot: ratio(botVals), SPY: ratio(spyVals), Bench6040: ratio(mix)}
 	}
+	if len(botRets) >= minVolDays {
+		out.VolatilityAnnPct = ptr(round2(annualise(stdev(botRets))))
+		out.TrackingErrorVsSPY = ptr(round2(annualise(stdev(activeReturns(botRets, spyRets)))))
+	}
+	if len(botRets) >= minBetaDays {
+		if beta, corr, ok := betaCorr(botRets, spyRets); ok {
+			out.BetaVsSPY, out.CorrelationVsSPY = ptr(round2(beta)), ptr(round2(corr))
+		}
+	}
 
 	orders, err := s.src.FilledOrders(s.start)
 	if err != nil {
 		return Stats{}, err
 	}
-	out.NumTrades = ptr(len(orders))
-	if wins, total := roundTrips(orders); total > 0 {
+	counts := countOrders(orders, s.start)
+	out.NumTrades, out.ExitsCount = ptr(counts.entries), ptr(counts.exits())
+	out.ExitsBreakdown = &ExitsBreakdown{StopLoss: counts.stops, TakeProfit: counts.takeProfits, Discretionary: counts.other}
+	wins, total := roundTrips(sinceStart(orders, s.start))
+	out.ClosedRoundTrips = ptr(total)
+	if total > 0 {
 		out.WinRatePct = ptr(round2(float64(wins) / float64(total) * 100))
 	}
 	open, err := s.src.OpenPositions()
@@ -251,6 +385,42 @@ func (s *Service) compute(now time.Time) (Stats, error) {
 		out.AllocationPct = &alloc
 	}
 	return out, nil
+}
+
+// orderCounts tallies filled orders by kind.
+type orderCounts struct{ entries, stops, takeProfits, other int }
+
+func (c orderCounts) exits() int { return c.stops + c.takeProfits + c.other }
+
+// sinceStart keeps the orders filled on or after start (an ET date), oldest
+// first. The broker query is by submission time, so this makes the cut exact.
+func sinceStart(orders []Order, start string) []Order {
+	out := make([]Order, 0, len(orders))
+	for _, o := range orders {
+		if o.FilledAt.IsZero() || o.FilledAt.In(newYork).Format("2006-01-02") >= start {
+			out = append(out, o)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].FilledAt.Before(out[j].FilledAt) })
+	return out
+}
+
+// countOrders counts the filled orders since start by Order.Classify.
+func countOrders(orders []Order, start string) orderCounts {
+	var c orderCounts
+	for _, o := range sinceStart(orders, start) {
+		switch o.Classify() {
+		case KindEntry:
+			c.entries++
+		case KindStop:
+			c.stops++
+		case KindTakeProfit:
+			c.takeProfits++
+		default:
+			c.other++
+		}
+	}
+	return c
 }
 
 // Performance returns the cached since-start returns (percent) of the bot,
