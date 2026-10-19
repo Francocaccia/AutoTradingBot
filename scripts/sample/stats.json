@@ -1,0 +1,23 @@
+{
+ "start_date": "2026-10-13",
+ "days_tracked": 14,
+ "allocation_pct": {
+  "equities": 46.2,
+  "bonds": 16.8,
+  "cash": 37.0
+ },
+ "policy_bands_pct": {
+  "equities": {
+   "min": 40,
+   "max": 75
+  },
+  "bonds": {
+   "min": 15,
+   "max": 40
+  },
+  "cash": {
+   "min": 5,
+   "max": 30
+  }
+ }
+}

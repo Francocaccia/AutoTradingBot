@@ -1,0 +1,60 @@
+name: Performance charts
+
+# Redraws docs/performance.svg and docs/allocation.svg from the bot's public
+# /stats/history and /stats endpoints after the US close, and commits them only
+# when they changed.
+on:
+  schedule:
+    - cron: "30 21 * * 1-5" # weekdays, 21:30 UTC (after the close in both EST and EDT)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: charts
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    env:
+      # Set the repository variable BOT_URL to override the default service address.
+      BOT_URL: ${{ vars.BOT_URL || 'https://autotradingbot-kjr0.onrender.com' }}
+      MIN_CHART_DAYS: "10"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Wake the service
+        # The free Render instance sleeps without traffic. Poll /health for up to
+        # 90 seconds; carry on either way, the script keeps the last good charts
+        # if the data still cannot be fetched.
+        run: |
+          end=$((SECONDS + 90))
+          while [ "$SECONDS" -lt "$end" ]; do
+            if curl -fsS --max-time 8 "$BOT_URL/health" >/dev/null; then
+              echo "service is up after ${SECONDS}s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::service did not answer /health within 90 seconds"
+
+      - name: Render charts
+        run: python scripts/render_chart.py --out docs
+
+      - name: Commit changed charts
+        run: |
+          if git diff --quiet -- docs/performance.svg docs/allocation.svg && [ -z "$(git ls-files --others --exclude-standard docs)" ]; then
+            echo "charts unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/performance.svg docs/allocation.svg
+          git commit -m "Update performance charts"
+          git push

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" width="760" height="380" role="img" aria-labelledby="t d">
+<title id="t">Allocation chart</title>
+<desc id="d">Tracking since 2026-10-13, chart appears after 10 trading days</desc>
+<style>
+  :root { --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --grid:#d8dee4; --band:#dbe9f6; --bar:#1f6feb;
+          --bot:#1f6feb; --spy:#d1730a; --qqq:#8250df; --mix:#1a7f37; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --grid:#30363d; --band:#1c2d44; --bar:#58a6ff;
+            --bot:#58a6ff; --spy:#f0883e; --qqq:#bc8cff; --mix:#3fb950; }
+  }
+  text { font-family:system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; fill:var(--fg); }
+  .muted { fill:var(--muted); }
+</style>
+<rect width="760" height="380" rx="8" fill="var(--bg)"/>
+<text x="380.0" y="184.0" text-anchor="middle" font-size="20" font-weight="600">Allocation chart</text>
+<text x="380.0" y="212.0" text-anchor="middle" font-size="15" class="muted">Tracking since 2026-10-13, chart appears after 10 trading days</text>
+<text x="380.0" y="362" text-anchor="middle" font-size="12" class="muted">Paper trading only. Not investment advice.</text>
+</svg>
