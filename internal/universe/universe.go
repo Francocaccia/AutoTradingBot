@@ -46,6 +46,10 @@ func DefaultLimits() Limits {
 	return Limits{MaxDayMovePct: 20, MaxRangePct: 15, MaxATRPct: 7, MinMarketCap: 2e9, MinDollarVol: 20_000_000}
 }
 
+// errAssetLookup marks a failed Alpaca asset lookup (as opposed to the asset
+// not existing or being rejected).
+var errAssetLookup = errors.New("asset lookup failed")
+
 var allowedExchanges = map[string]bool{"NYSE": true, "NASDAQ": true, "ARCA": true}
 
 var symbolRe = regexp.MustCompile(`^[A-Z]{1,5}$`)
@@ -159,7 +163,7 @@ func (u *Universe) Build(newsSymbols []string) []Item {
 	}
 	for _, sym := range u.Core {
 		seen[sym] = true
-		if ind, err := u.Validate(sym); err != nil {
+		if ind, err := u.validateCore(sym); err != nil {
 			log.Printf("[Universe] core %s skipped: %v", sym, err)
 		} else {
 			items = append(items, Item{Symbol: sym, Ind: ind, Core: true, Validated: true})
@@ -272,6 +276,30 @@ func (u *Universe) Validate(symbol string) (*indicators.Result, error) {
 	return ind, err
 }
 
+// validateCore is Validate for a core watchlist symbol, which fails open: a
+// data outage (the Alpaca asset lookup failing, Yahoo fundamentals or volume
+// missing) never drops it, it only logs a warning. What still drops it is a real
+// rejection (not tradable, a leveraged product, a price under the floor) or having
+// no price data at all from any source, since there is then nothing to evaluate.
+func (u *Universe) validateCore(symbol string) (*indicators.Result, error) {
+	asset, err := u.checkedAsset(symbol, nil)
+	if err != nil {
+		if !errors.Is(err, errAssetLookup) {
+			return nil, err
+		}
+		log.Printf("[Universe] WARN core %s: %v; continuing without the Alpaca asset check", symbol, err)
+		asset = nil
+	}
+	ind, _, err := u.validateMarket(symbol, asset)
+	if err != nil {
+		return nil, err
+	}
+	if ind.StaleFor > 0 {
+		log.Printf("[Universe] WARN core %s: market data is %s old (refresh failing); using it", symbol, ind.StaleFor.Round(time.Second))
+	}
+	return ind, nil
+}
+
 // checkedAsset runs the symbol and Alpaca-side filters. cache (optional)
 // remembers lookups so a symbol is only fetched from Alpaca once per Build.
 func (u *Universe) checkedAsset(symbol string, cache map[string]*Asset) (*Asset, error) {
@@ -289,7 +317,7 @@ func (u *Universe) checkedAsset(symbol string, cache map[string]*Asset) (*Asset,
 			if errors.Is(err, broker.ErrNotFound) {
 				return nil, errors.New("asset does not exist on Alpaca")
 			}
-			return nil, fmt.Errorf("asset lookup failed: %w", err)
+			return nil, fmt.Errorf("%w: %v", errAssetLookup, err)
 		}
 		if cache != nil {
 			cache[symbol] = asset

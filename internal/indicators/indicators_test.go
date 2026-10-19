@@ -174,8 +174,9 @@ func TestFundamentalsGiveUpAfterThreeAttempts(t *testing.T) {
 	}
 }
 
-// When Yahoo fails on refresh, the last good average volume (< 24h old) is used.
-func TestLastGoodAvgVolumeIsFallbackFor24h(t *testing.T) {
+// When Yahoo fails on refresh, the last good fundamentals (and so the average
+// volume) are served for up to FundStaleMax, labelled as cached, and then dropped.
+func TestStaleFundamentalsServeTheVolumeUntilTheyExpire(t *testing.T) {
 	failing := false
 	now := time.Date(2026, 10, 12, 14, 0, 0, 0, time.UTC)
 	p := newFastProvider(func(args ...string) ([]byte, []byte, error) {
@@ -201,16 +202,16 @@ func TestLastGoodAvgVolumeIsFallbackFor24h(t *testing.T) {
 	if err != nil || res.AvgVolume != 5_000_000 {
 		t.Fatalf("a failed refresh must fall back to the last good volume: %+v %v", res, err)
 	}
-	if res.VolumeSource != "cache" || !strings.Contains(logs.String(), "using the cached value") {
+	if res.VolumeSource != "cache" || !strings.Contains(logs.String(), "serving data from") {
 		t.Errorf("a cached volume must be labelled and logged: source=%q logs=%q", res.VolumeSource, logs.String())
 	}
-	if res.Sector != "" {
-		t.Errorf("only the volume falls back, got %+v", res)
+	if res.Sector != "Tech" {
+		t.Errorf("the rest of the stale fundamentals is kept too, got %+v", res)
 	}
 
-	now = now.Add(12 * time.Hour) // 25h since the last good value
-	if res, _ := p.Calculate("AAA"); res.AvgVolume != 0 {
-		t.Errorf("a fallback older than 24h must not be used: %+v", res)
+	now = now.Add(FundStaleMax) // far beyond every fallback
+	if res, _ := p.Calculate("AAA"); res.AvgVolume != 0 || res.Sector != "" {
+		t.Errorf("expired fundamentals must not be used: %+v", res)
 	}
 }
 

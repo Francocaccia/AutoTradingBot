@@ -58,5 +58,94 @@ class CandidateMetricsTest(unittest.TestCase):
         self.assertEqual(calculate.avg_dollar_volume(df), 10000.0)
 
 
+class WorkerResilienceTest(unittest.TestCase):
+    def test_http_get_json_retries_429_and_5xx_then_succeeds(self):
+        import io
+        import urllib.error
+
+        calls = []
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def opener(req, timeout):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError("u", 429, "slow down", {}, io.BytesIO(b""))
+            if len(calls) == 2:
+                raise urllib.error.URLError("connection reset")
+            return Resp()
+
+        sleeps = []
+        out = calculate.http_get_json("req", opener=opener, sleep=sleeps.append)
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(sleeps), 2)
+        self.assertTrue(all(t == calculate.REQUEST_TIMEOUT_S for t in calls))
+
+    def test_http_get_json_does_not_retry_real_errors(self):
+        import io
+        import urllib.error
+
+        calls = []
+
+        def opener(req, timeout):
+            calls.append(1)
+            raise urllib.error.HTTPError("u", 403, "forbidden", {}, io.BytesIO(b""))
+
+        with self.assertRaises(urllib.error.HTTPError):
+            calculate.http_get_json("req", opener=opener, sleep=lambda d: None)
+        self.assertEqual(len(calls), 1)
+
+    def test_http_get_json_gives_up_after_three_attempts(self):
+        import urllib.error
+
+        calls = []
+
+        def opener(req, timeout):
+            calls.append(1)
+            raise urllib.error.URLError("down")
+
+        with self.assertRaises(urllib.error.URLError):
+            calculate.http_get_json("req", opener=opener, sleep=lambda d: None)
+        self.assertEqual(len(calls), 3)
+
+    def test_fundamentals_stop_at_the_time_budget(self):
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        def get_info(sym):
+            now[0] += 30.0  # every symbol takes 30 seconds
+            return {"averageVolume": 1000, "quoteType": "EQUITY", "beta": 1.1}
+
+        out = calculate.collect_fundamentals(["A", "B", "C", "D"], get_info, 60.0, clock=clock, sleep=lambda d: None)
+        self.assertEqual(out["A"]["avg_volume"], 1000.0)
+        self.assertEqual(out["B"]["avg_volume"], 1000.0)
+        self.assertIn("time budget", out["C"]["error"])
+        self.assertIn("time budget", out["D"]["error"])
+
+    def test_empty_yahoo_answer_is_a_failure_not_zeros(self):
+        out = calculate.collect_fundamentals(["A"], lambda s: {}, 60.0, sleep=lambda d: None)
+        self.assertIn("no data", out["A"]["error"])
+
+    def test_budget_comes_from_the_environment(self):
+        os.environ["WORKER_BUDGET_S"] = "42"
+        try:
+            self.assertEqual(calculate.budget_seconds(), 42.0)
+            os.environ["WORKER_BUDGET_S"] = "junk"
+            self.assertEqual(calculate.budget_seconds(), calculate.DEFAULT_BUDGET_S)
+        finally:
+            del os.environ["WORKER_BUDGET_S"]
+
+
 if __name__ == "__main__":
     unittest.main()

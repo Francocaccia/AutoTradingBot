@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -35,10 +37,13 @@ type Result struct {
 	// Yahoo value, up to 24h old), "bars" (consolidated bars) or "" (unknown).
 	VolumeSource string  `json:"-"`
 	RelVolume    float64 `json:"rel_volume"` // last completed session volume / mean of the 60 sessions before it, same bars on both sides; 0 = unknown
-	Sector       string  `json:"sector"`     // empty when unavailable (e.g. ETFs)
-	Name         string  `json:"name"`
-	QuoteType    string  `json:"quote_type"` // EQUITY, ETF, ...
-	Source       string  `json:"source"`     // alpaca-iex or yfinance (bars)
+	// StaleFor is how old the technicals are when a refresh failed and the last
+	// good ones are served instead (stale-while-error); 0 = fresh.
+	StaleFor  time.Duration `json:"-"`
+	Sector    string        `json:"sector"` // empty when unavailable (e.g. ETFs)
+	Name      string        `json:"name"`
+	QuoteType string        `json:"quote_type"` // EQUITY, ETF, ...
+	Source    string        `json:"source"`     // alpaca-iex or yfinance (bars)
 
 	Ichimoku   IchimokuResult   `json:"ichimoku"`
 	MACD       MACDResult       `json:"macd"`
@@ -72,8 +77,20 @@ type KeltnerResult struct {
 }
 
 const (
-	calcTimeout = 120 * time.Second
-	scriptPath  = "python/indicators/calculate.py"
+	scriptPath = "python/indicators/calculate.py"
+
+	// Timeouts of one worker run, by mode. The worker also keeps its own deadline
+	// (see calculate.py), so these are the last resort against a hung process.
+	barsTimeout         = 100 * time.Second
+	fundamentalsTimeout = 110 * time.Second
+	macroTimeout        = 75 * time.Second
+
+	// Stale-while-error: when a refresh fails the last good value is served for up
+	// to this long, with a warning, instead of nothing. Prices are the shortest,
+	// because an order is sized from them; yields, the VIX and fundamentals move slowly.
+	BarsStaleMax  = 30 * time.Minute
+	FundStaleMax  = 72 * time.Hour
+	MacroStaleMax = 24 * time.Hour
 
 	MacroTTL        = time.Hour        // yields, VIX, SPY/TLT trend
 	BarsTTL         = 10 * time.Minute // technicals
@@ -87,10 +104,26 @@ const (
 // Runner executes the Python worker and returns its raw stdout and stderr.
 type Runner func(args ...string) (stdout, stderr []byte, err error)
 
+// modeTimeout is how long a worker run of the given mode may take.
+func modeTimeout(mode string) time.Duration {
+	switch mode {
+	case "bars":
+		return barsTimeout
+	case "macro":
+		return macroTimeout
+	}
+	return fundamentalsTimeout
+}
+
 func execRunner(args ...string) ([]byte, []byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), calcTimeout)
+	mode := ""
+	if len(args) > 0 {
+		mode = args[0]
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), modeTimeout(mode))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", append([]string{scriptPath}, args...)...)
+	cmd.Env = append(os.Environ(), "WORKER_BUDGET_S="+strconv.Itoa(int(modeTimeout(mode)/time.Second)-15))
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -98,15 +131,19 @@ func execRunner(args ...string) ([]byte, []byte, error) {
 }
 
 type barsEntry struct {
-	res *Result
-	err error
-	at  time.Time
+	res    *Result
+	err    error
+	at     time.Time // last refresh attempt
+	goodAt time.Time // when res was fetched
+	stale  bool      // res is the last good value, served because the latest refresh failed
 }
 
 type fundEntry struct {
-	f   *fundamentals
-	err error
-	at  time.Time
+	f      *fundamentals
+	err    error
+	at     time.Time
+	goodAt time.Time
+	stale  bool
 }
 
 type fundamentals struct {
@@ -177,9 +214,11 @@ func (m Macro) MA200(sym string) (float64, bool) {
 }
 
 type macroEntry struct {
-	m   Macro
-	err error
-	at  time.Time
+	m      Macro
+	err    error
+	at     time.Time
+	goodAt time.Time
+	stale  bool
 }
 
 // addJitter returns d plus up to 50% of d.
@@ -239,8 +278,8 @@ func (p *Provider) barsFresh(s string) bool {
 		return false
 	}
 	ttl := BarsTTL
-	if e.err != nil {
-		ttl = failureTTL
+	if e.err != nil || e.stale {
+		ttl = failureTTL // retry soon: a stale value is only a stop-gap
 	}
 	return p.now().Sub(e.at) < ttl
 }
@@ -251,7 +290,7 @@ func (p *Provider) fundFresh(s string) bool {
 		return false
 	}
 	ttl := FundamentalsTTL
-	if e.err != nil {
+	if e.err != nil || e.stale {
 		ttl = failureTTL
 	}
 	return p.now().Sub(e.at) < ttl
@@ -283,8 +322,27 @@ func (p *Provider) call(mode string, symbols []string) (map[string]json.RawMessa
 	return raw, nil
 }
 
+// callRetryDelays are the waits before retry 1 and 2 of a whole-batch worker
+// failure (3 attempts in all).
+var callRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second}
+
+// callRetry is call with a short, jittered backoff between attempts. Only a
+// failure of the whole run is retried; a symbol the worker reports an error for
+// is a real answer.
+func (p *Provider) callRetry(mode string, symbols []string) (map[string]json.RawMessage, error) {
+	for attempt := 0; ; attempt++ {
+		raw, err := p.call(mode, symbols)
+		if err == nil || attempt >= len(callRetryDelays) {
+			return raw, err
+		}
+		delay := p.jitter(callRetryDelays[attempt])
+		log.Printf("[Indicators] %s run failed (%v); retry %d/%d in %s", mode, err, attempt+1, len(callRetryDelays), delay)
+		p.sleep(delay)
+	}
+}
+
 func (p *Provider) fetchBars(symbols []string) {
-	raw, batchErr := p.call("bars", symbols)
+	raw, batchErr := p.callRetry("bars", symbols)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
@@ -306,7 +364,14 @@ func (p *Provider) fetchBars(symbols []string) {
 				e.err = errors.New(errOnly.Error)
 			} else {
 				r.Symbol = s
-				e.res = &r
+				e.res, e.goodAt = &r, now
+			}
+		}
+		if e.err != nil {
+			// Stale-while-error: keep the last good technicals for a little while.
+			if prev := p.bars[s]; prev.res != nil && now.Sub(prev.goodAt) < BarsStaleMax {
+				log.Printf("[Indicators] WARN %s: refresh failed (%v); serving data from %s ago", s, e.err, now.Sub(prev.goodAt).Round(time.Second))
+				e = barsEntry{res: prev.res, at: now, goodAt: prev.goodAt, stale: true}
 			}
 		}
 		p.bars[s] = e
@@ -338,7 +403,7 @@ func (p *Provider) fetchFund(symbols []string) {
 				} else if f.Error != "" {
 					e.err = errors.New(f.Error)
 				} else {
-					e.f = &f
+					e.f, e.goodAt = &f, now
 				}
 			}
 			if e.err != nil {
@@ -359,6 +424,13 @@ func (p *Provider) fetchFund(symbols []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for s, e := range results {
+		if e.err != nil {
+			// Stale-while-error: beta, sector, name and the like barely change.
+			if prev := p.funds[s]; prev.f != nil && e.at.Sub(prev.goodAt) < FundStaleMax {
+				log.Printf("[Indicators] WARN %s: fundamentals refresh failed (%v); serving data from %s ago", s, e.err, e.at.Sub(prev.goodAt).Round(time.Minute))
+				e = fundEntry{f: prev.f, at: e.at, goodAt: prev.goodAt, stale: true}
+			}
+		}
 		p.funds[s] = e
 		if e.f != nil && e.f.AvgVolume > 0 {
 			p.lastVol[s] = volEntry{v: e.f.AvgVolume, at: e.at}
@@ -379,6 +451,9 @@ func (p *Provider) Calculate(symbol string) (*Result, error) {
 		return nil, fmt.Errorf("indicators for %s: %w", symbol, b.err)
 	}
 	res := *b.res
+	if b.stale {
+		res.StaleFor = p.now().Sub(b.goodAt)
+	}
 	if f := p.funds[symbol].f; f != nil {
 		res.Beta, res.PE, res.Sector, res.Name, res.QuoteType, res.MarketCap = f.Beta, f.PE, f.Sector, f.Name, f.QuoteType, f.MarketCap
 		// IEX bar volume is a small slice of consolidated volume, so liquidity
@@ -387,6 +462,9 @@ func (p *Provider) Calculate(symbol string) (*Result, error) {
 			res.AvgVolume = f.AvgVolume
 			if res.AvgVolume > 0 {
 				res.VolumeSource = "yahoo"
+				if p.funds[symbol].stale {
+					res.VolumeSource = "cache"
+				}
 			}
 		}
 	} else if res.Source != "yfinance" {
@@ -407,24 +485,26 @@ func (p *Provider) Calculate(symbol string) (*Result, error) {
 }
 
 // Macro returns the macro series, fetched through the Python worker and
-// cached for MacroTTL.
+// cached for MacroTTL. A failed refresh is retried with a backoff, and if it
+// still fails the last good series is served for up to MacroStaleMax with a
+// warning: yields, the VIX and the 200-day averages move slowly, and losing the
+// regime to a Yahoo hiccup would restrict bond purchases for no reason.
 func (p *Provider) Macro() (Macro, error) {
 	p.mu.Lock()
-	e := p.macro
+	prev := p.macro
 	p.mu.Unlock()
 	ttl := MacroTTL
-	if e.err != nil {
+	if prev.err != nil || prev.stale {
 		ttl = macroFailureTTL
 	}
-	if !e.at.IsZero() && p.now().Sub(e.at) < ttl {
-		return e.m, e.err
+	if !prev.at.IsZero() && p.now().Sub(prev.at) < ttl {
+		return prev.m, prev.err
 	}
 
-	raw, err := p.call("macro", nil)
-	e = macroEntry{at: p.now()}
-	if err != nil {
-		e.err = err
-	} else {
+	raw, err := p.callRetry("macro", nil)
+	now := p.now()
+	e := macroEntry{at: now}
+	if err == nil {
 		e.m = Macro{}
 		for sym, msg := range raw {
 			var q MacroQuote
@@ -433,8 +513,17 @@ func (p *Provider) Macro() (Macro, error) {
 			}
 		}
 		if len(e.m) == 0 {
-			e.err = errors.New("no macro series returned")
+			e.m, err = nil, errors.New("no macro series returned")
 		}
+	}
+	switch {
+	case err == nil:
+		e.goodAt = now
+	case prev.m != nil && now.Sub(prev.goodAt) < MacroStaleMax:
+		log.Printf("[Indicators] WARN macro refresh failed (%v); serving the series from %s ago", err, now.Sub(prev.goodAt).Round(time.Minute))
+		e = macroEntry{m: prev.m, at: now, goodAt: prev.goodAt, stale: true}
+	default:
+		e.err = err
 	}
 	p.mu.Lock()
 	p.macro = e

@@ -59,16 +59,20 @@ func TestMacroFailureDegradesAndRetriesLater(t *testing.T) {
 		return []byte(`{"error":"Too Many Requests"}`), nil, errors.New("exit 0")
 	})
 	p.now = func() time.Time { return now }
+	p.sleep = func(time.Duration) {}
 	if _, err := p.Macro(); err == nil {
 		t.Fatal("want an error")
 	}
+	if n != 3 {
+		t.Errorf("one refresh is three attempts with a backoff, calls = %d", n)
+	}
 	p.Macro()
-	if n != 1 {
+	if n != 3 {
 		t.Errorf("failure must be cached briefly, calls = %d", n)
 	}
 	now = now.Add(11 * time.Minute)
 	p.Macro()
-	if n != 2 {
+	if n != 6 {
 		t.Errorf("failure must be retried after the failure TTL, calls = %d", n)
 	}
 }

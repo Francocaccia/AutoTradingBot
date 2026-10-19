@@ -18,6 +18,7 @@ import random
 import logging
 import warnings
 import urllib.request
+import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
@@ -28,6 +29,13 @@ import pandas as pd
 
 MIN_BARS = 52
 RATE_LIMIT_MARKERS = ("too many requests", "rate limit", "429", "yfratelimit")
+
+# Per-request timeout for every outbound call, so a hung connection cannot eat
+# the whole run (the Go caller also kills the process after its own timeout).
+REQUEST_TIMEOUT_S = 20
+# The Go caller passes the seconds this run may use; loops that make many calls
+# stop at that deadline and report the remaining symbols as failed.
+DEFAULT_BUDGET_S = 80.0
 
 
 def safe(value):
@@ -187,6 +195,37 @@ def with_retry(fn, attempts=3, base=2.0):
             time.sleep(delay)
 
 
+def budget_seconds():
+    """Seconds this run may take, from WORKER_BUDGET_S (set by the Go caller)."""
+    try:
+        return max(float(os.environ.get("WORKER_BUDGET_S", DEFAULT_BUDGET_S)), 5.0)
+    except ValueError:
+        return DEFAULT_BUDGET_S
+
+
+def http_get_json(req, attempts=3, base=1.0, opener=None, sleep=time.sleep):
+    """GET req and decode JSON, retrying timeouts, 429 and 5xx with a jittered backoff.
+
+    Other HTTP errors (401, 403, 404, 422...) are real answers and are raised at once.
+    """
+    opener = opener or urllib.request.urlopen
+    for i in range(attempts):
+        try:
+            with opener(req, timeout=REQUEST_TIMEOUT_S) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 and exc.code < 500:
+                raise
+            err = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            err = exc
+        if i == attempts - 1:
+            raise err
+        delay = base * (2 ** i) + random.uniform(0, 0.5)
+        print(f"alpaca request failed ({err}); retrying in {delay:.1f}s", file=sys.stderr)
+        sleep(delay)
+
+
 def technicals(symbol, df, source):
     if df is None or df.empty:
         raise ValueError(f"no data for {symbol}")
@@ -229,8 +268,7 @@ def alpaca_bars(symbols):
         req = urllib.request.Request(
             "https://data.alpaca.markets/v2/stocks/bars?" + urllib.parse.urlencode(params),
             headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = http_get_json(req)
         for sym, bars in (data.get("bars") or {}).items():
             rows.setdefault(sym, []).extend(bars)
         token = data.get("next_page_token")
@@ -250,7 +288,7 @@ def yahoo_bars(symbols):
 
     def fetch():
         return yf.download(list(symbols), period="3mo", interval="1d", group_by="ticker",
-                           threads=False, progress=False, auto_adjust=False)
+                           threads=False, progress=False, auto_adjust=False, timeout=REQUEST_TIMEOUT_S)
 
     raw = with_retry(fetch)
     out = {}
@@ -293,15 +331,22 @@ def cmd_bars(symbols):
     return out
 
 
-def cmd_fundamentals(symbols):
-    import yfinance as yf
+def collect_fundamentals(symbols, get_info, budget_s, clock=time.monotonic, sleep=time.sleep):
+    """{sym: fundamentals | {"error": ...}} using get_info(sym) -> dict.
 
+    Stops at the time budget: symbols not reached are reported as failed so the
+    caller can serve cached values instead of waiting on a throttled source.
+    """
     out = {}
+    start = clock()
     for i, sym in enumerate(symbols):
+        if clock() - start >= budget_s:
+            out[sym] = {"error": "time budget exhausted before this symbol"}
+            continue
         if i:
-            time.sleep(random.uniform(0.3, 1.0))  # jitter between per-ticker requests
+            sleep(random.uniform(0.3, 1.0))  # jitter between per-ticker requests
         try:
-            info = with_retry(lambda: yf.Ticker(sym).info) or {}
+            info = get_info(sym) or {}
             if not info.get("averageVolume") and not info.get("quoteType"):
                 # Throttled Yahoo often answers with an empty info dict instead of an
                 # error. Report it as a failure so the Go caller retries instead of
@@ -321,6 +366,12 @@ def cmd_fundamentals(symbols):
     return out
 
 
+def cmd_fundamentals(symbols):
+    import yfinance as yf
+
+    return collect_fundamentals(symbols, lambda sym: with_retry(lambda: yf.Ticker(sym).info), budget_seconds())
+
+
 MACRO_YIELDS = ("^IRX", "^FVX", "^TNX", "^TYX")
 
 
@@ -337,7 +388,7 @@ def cmd_macro():
 
     def fetch():
         return yf.download(syms, period="1y", interval="1d", group_by="ticker",
-                           threads=False, progress=False, auto_adjust=False)
+                           threads=False, progress=False, auto_adjust=False, timeout=REQUEST_TIMEOUT_S)
 
     raw = with_retry(fetch)
     out = {}
