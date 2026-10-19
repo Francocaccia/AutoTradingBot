@@ -209,6 +209,9 @@ type ReviewInput struct {
 	// EquityETFs are the core equity ETFs (SPY, QQQ) the review may also buy.
 	EquityETFs []string
 	Held       []string
+	// BandsFilledByBot says the bot itself buys core ETFs in small tranches to
+	// bring a sleeve under its band minimum back inside the band.
+	BandsFilledByBot bool
 }
 
 // BuildReviewPrompt renders the weekly review prompt.
@@ -221,13 +224,15 @@ func BuildReviewPrompt(in ReviewInput) string {
 - LONG-ONLY cash account. No shorting, margin, leverage or options. SELL closes a whole existing position.
 - Targets are % of equity for equities, bonds and cash and must sum to 100. They must stay inside the IPS bands shown; the bot clips or rejects anything outside.
 - Doing nothing is valid and often best. Return an empty actions list unless a move clearly improves risk-adjusted return. Cash inside its band is NOT a problem and must not trigger buying. If cash is above its band maximum you may propose parking it in SGOV, BIL or SHY.
-- Every action needs a role, a catalyst that is ONE verbatim line copied from the PORTFOLIO block (never several joined together) and a portfolio_rationale saying how it changes risk. When a band breach triggered this review the bot sets the catalyst itself, but the rationale is still required. Justify any duration or credit choice with the regime data.
-- A sleeve far outside its band is closed gradually: each BUY is capped at 5% of equity and the bot allows only a few trades a day, so propose only today's moves and expect to continue on later days.
-- If equity risk is elevated (high VIX, SPY below its 200d MA, inverted curve), lean toward shorter-duration bonds and cash rather than forcing equity exposure. Bonds are not free: in a rising-rate regime long duration loses.
+- Every action needs a role, a catalyst that is ONE verbatim line copied from the PORTFOLIO block (never several joined together) and a portfolio_rationale saying how it changes risk. Justify any duration or credit choice with the regime data.
+- The IPS bands shown in the PORTFOLIO block are policy limits, not suggestions: do not propose anything that moves a sleeve toward leaving its band, and do not argue for holding more cash than the cash band allows or less equity than the equity floor. If equity risk is elevated (high VIX, SPY below its 200d MA, inverted curve), express that inside the bands: prefer shorter-duration bonds within the bond band and broad index ETFs over concentrated single stocks. Bonds are not free: in a rising-rate regime long duration loses.
 - BUY only the bond ETFs listed (T-bill ETFs park cash) or the core equity ETFs listed (to raise an equity sleeve that is under its band or target); SELL only held symbols. Do not add a position highly correlated with what is held unless it replaces it.
 - Prefer the highest risk-adjusted return, not the highest return.
-
 `)
+	if in.BandsFilledByBot {
+		sb.WriteString("- The bot itself buys core ETFs in small tranches to bring a sleeve that is below its band minimum back inside the band, so do not propose purchases only to fix a band; propose only moves you would make on their own merits.\n")
+	}
+	sb.WriteString("\n")
 	sb.WriteString(in.Portfolio)
 	sb.WriteString("\n## BOND ETFS YOU MAY BUY\n")
 	for _, b := range in.Bonds {

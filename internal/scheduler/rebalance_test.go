@@ -1,8 +1,6 @@
 package scheduler
 
 import (
-	"log"
-	"os"
 	"strings"
 	"testing"
 
@@ -98,46 +96,13 @@ func TestReviewMayBuyBondSleeveCoreEquityETFsAndCashParking(t *testing.T) {
 	}
 }
 
-func TestBandBreachRebalanceSetsCatalystInCodeAndStepsGradually(t *testing.T) {
-	var logs strings.Builder
-	log.SetOutput(&logs)
-	defer log.SetOutput(os.Stderr)
-
-	s, o := reviewScheduler(baseConfig())
-	cs := rebalanceCycle(s)
-
-	// The model quoted garbage and asked for a 10%-conviction position: the code
-	// replaces the catalyst, but the step is still capped at 5% of equity.
-	r := &gemini.Review{Actions: []gemini.ReviewAction{reviewBuy("SPY", 10, "garbage not in the block")}}
-	s.applyReview("band breach of 39.0 points (cash 69.0% vs band 5-30%)", r, cs, richBlock)
-	if len(cs.pending) != 1 {
-		t.Fatalf("pending = %+v", cs.pending)
-	}
-	p := cs.pending[0]
-	if !p.rebalance || p.decision.Catalyst != "band breach: cash 69.0% > 30% max" {
-		t.Fatalf("catalyst/rebalance = %q %v", p.decision.Catalyst, p.rebalance)
-	}
-
-	s.executeDecisions(cs)
-	ord, ok := o.order("SPY")
-	if !ok || ord.kind != "bracket" {
-		t.Fatalf("SPY must be bought: %+v ok=%v drops=%v", ord, ok, cs.dropReasons)
-	}
-	if ord.qty != 50 { // 5% of 100k at $100; conviction 10 alone would be 100 shares
-		t.Errorf("qty = %d, want 50 (5%% of equity per trade)", ord.qty)
-	}
-	if !strings.Contains(logs.String(), "rebalance in progress, 34.0 points remaining") {
-		t.Errorf("progress not logged:\n%s", logs.String())
-	}
-}
-
-func TestRebalanceStillRequiresRationaleAndKeepsEveryOtherGuard(t *testing.T) {
+func TestReviewBuyStillRequiresRationaleAndKeepsEveryGuard(t *testing.T) {
 	s, o := reviewScheduler(baseConfig())
 	cs := rebalanceCycle(s)
 	noRationale := reviewBuy("SPY", 9, "x")
 	noRationale.Rationale = ""
 	lowConviction := reviewBuy("QQQ", 5, "x")
-	s.applyReview("band breach", &gemini.Review{Actions: []gemini.ReviewAction{noRationale, lowConviction}}, cs, richBlock)
+	s.applyReview("weekly review", &gemini.Review{Actions: []gemini.ReviewAction{noRationale, lowConviction}}, cs, richBlock)
 	s.executeDecisions(cs)
 	if len(o.placed) != 0 || cs.dropReasons["role/rationale"] != 1 || cs.dropReasons["conviction"] != 1 {
 		t.Errorf("orders %+v drops %v", o.placed, cs.dropReasons)
@@ -149,28 +114,10 @@ func TestRebalanceStillRequiresRationaleAndKeepsEveryOtherGuard(t *testing.T) {
 	withRegime(cs, true)
 	withAccount(s, cs, 100_000, 69_000)
 	hold(cs, "AAPL", 31_000)
-	s.applyReview("band breach", &gemini.Review{Actions: []gemini.ReviewAction{reviewBuy("SPY", 9, "x")}}, cs, richBlock)
+	s.applyReview("weekly review", &gemini.Review{Actions: []gemini.ReviewAction{reviewBuy("SPY", 9, "VIX: 27.3")}}, cs, richBlock)
 	s.executeDecisions(cs)
 	if len(o.placed) != 0 || cs.dropReasons["cap"] != 1 {
-		t.Errorf("daily cap must hold back a rebalance BUY: %+v %v", o.placed, cs.dropReasons)
-	}
-}
-
-func TestLargeBreachIsClosedOverSeveralTradesNotOne(t *testing.T) {
-	s, o := reviewScheduler(baseConfig())
-	cs := rebalanceCycle(s)
-	r := &gemini.Review{Actions: []gemini.ReviewAction{reviewBuy("SPY", 10, "x"), reviewBuy("QQQ", 10, "x")}}
-	s.applyReview("band breach", r, cs, richBlock)
-	s.executeDecisions(cs)
-	var spent float64
-	for _, ord := range o.placed {
-		spent += float64(ord.qty) * 100
-	}
-	if len(o.placed) != 2 || spent > 10_000+1e-6 {
-		t.Fatalf("two trades of at most 5%% each, got %+v (spent %.0f)", o.placed, spent)
-	}
-	if pts, _ := s.policy.BandBreach(s.bookFrom(cs, &portfolio.Account{Equity: 100_000, Cash: 69_000 - spent})); pts < 25 {
-		t.Errorf("a 39-point breach cannot be closed by 2 trades, %.1f points should remain", pts)
+		t.Errorf("daily cap must hold back a review BUY: %+v %v", o.placed, cs.dropReasons)
 	}
 }
 
@@ -187,8 +134,8 @@ func TestReviewBuyWithoutBreachNeedsOneItemFromThePortfolioBlock(t *testing.T) {
 
 	s, o, cs := inBand()
 	s.applyReview("weekly review", &gemini.Review{Actions: []gemini.ReviewAction{reviewBuy("QQQ", 9, "VIX: 27.3")}}, cs, richBlock)
-	if len(cs.pending) != 1 || cs.pending[0].rebalance {
-		t.Fatalf("an in-band weekly BUY is not a rebalance: %+v", cs.pending)
+	if len(cs.pending) != 1 {
+		t.Fatalf("an in-band weekly BUY is queued: %+v", cs.pending)
 	}
 	s.executeDecisions(cs)
 	if _, ok := o.order("QQQ"); !ok {
@@ -209,7 +156,7 @@ func TestReviewBuyOfASleeveAtItsTargetIsRejected(t *testing.T) {
 	withRegime(cs, true)
 	withAccount(s, cs, 100_000, 38_000)
 	hold(cs, "AAPL", 62_000) // equities 62% >= the 60% target
-	s.applyReview("band breach", &gemini.Review{Actions: []gemini.ReviewAction{reviewBuy("SPY", 9, "x")}}, cs, richBlock)
+	s.applyReview("weekly review", &gemini.Review{Actions: []gemini.ReviewAction{reviewBuy("SPY", 9, "VIX: 27.3")}}, cs, richBlock)
 	s.executeDecisions(cs)
 	if len(o.placed) != 0 || cs.dropReasons["sleeve-target"] != 1 {
 		t.Errorf("the sleeve is not under target: %+v %v", o.placed, cs.dropReasons)
@@ -217,25 +164,25 @@ func TestReviewBuyOfASleeveAtItsTargetIsRejected(t *testing.T) {
 }
 
 func TestReviewRunsAtMostOncePerDayAndNeverWhileGeminiIsPaused(t *testing.T) {
-	// Monday, a band review already ran today: no weekly review on top of it.
+	// Monday, the weekly review already ran today: not again.
 	s, _ := newTestScheduler(baseConfig())
 	cs := rebalanceCycle(s)
-	s.lastBandReviewDay = "2026-10-12"
-	if r := s.reviewReason(cs, session("2026-10-12", "11:00")); r != "" {
-		t.Errorf("second review the same day: %q", r)
-	}
-	s.lastBandReviewDay, s.lastReviewDay = "", "2026-10-12"
-	if r := s.reviewReason(cs, session("2026-10-12", "11:00")); r != "" {
-		t.Errorf("band review after the weekly one: %q", r)
+	s.lastReviewDay = "2026-10-12"
+	if r, why := s.reviewDecision(cs, session("2026-10-12", "11:00")); r != "" || !strings.Contains(why, "already ran") {
+		t.Errorf("second review the same day: %q (%q)", r, why)
 	}
 
-	// Paused: no call, and the day is not marked as done.
+	// Paused: no call, the day is not marked as done, and the [Review] line says why.
 	s, _ = newTestScheduler(baseConfig())
 	cs = rebalanceCycle(s)
 	s.geminiPaused = func() (bool, string) { return true, "daily quota exhausted" }
+	s.llm = &fakeLLM{}
 	s.maybeReview(cs, session("2026-10-12", "11:00"))
-	if s.lastReviewDay != "" || s.lastBandReviewDay != "" || len(cs.pending) != 0 {
-		t.Errorf("a paused client must skip the review without consuming the day: %q %q %+v", s.lastReviewDay, s.lastBandReviewDay, cs.pending)
+	if s.lastReviewDay != "" || len(cs.pending) != 0 {
+		t.Errorf("a paused client must skip the review without consuming the day: %q %+v", s.lastReviewDay, cs.pending)
+	}
+	if len(cs.whyNot) != 1 || !strings.Contains(cs.whyNot[0], "Gemini is paused (daily quota exhausted)") {
+		t.Errorf("reason = %v", cs.whyNot)
 	}
 }
 

@@ -138,10 +138,23 @@ type Levels struct {
 // take-profit. proposedTP <= 0 means "choose for me" (exactly 2R); otherwise
 // the proposal is used and rejected if its reward:risk is below MinRewardRisk.
 func Bracket(price, atr, proposedTP float64) (Levels, error) {
+	return BracketMult(price, atr, proposedTP, StopATRMultiple)
+}
+
+// EffectiveStopMultiple is the ATR multiple of a stock stop: at least
+// StopATRMultiple, and at least min (MIN_STOP_ATR_MULT) when that is larger.
+// The ATR is the average true range, which is never below the average daily
+// range, so a stop of this many ATRs also clears a normal day's range.
+func EffectiveStopMultiple(min float64) float64 {
+	return math.Max(StopATRMultiple, min)
+}
+
+// BracketMult is Bracket with the stop mult x ATR below price.
+func BracketMult(price, atr, proposedTP, mult float64) (Levels, error) {
 	if price <= 0 || atr <= 0 {
 		return Levels{}, fmt.Errorf("need positive price (%.2f) and ATR (%.4f)", price, atr)
 	}
-	stop := math.Floor((price-StopATRMultiple*atr)*100) / 100
+	stop := math.Floor((price-mult*atr)*100) / 100
 	if stop <= 0 {
 		return Levels{}, fmt.Errorf("ATR stop would be non-positive (price %.2f, ATR %.2f)", price, atr)
 	}

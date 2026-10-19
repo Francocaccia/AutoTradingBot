@@ -97,6 +97,8 @@ type Client struct {
 	window      []time.Time     // request times within the last minute
 	unavailable map[string]bool // models that answered 404/400/403: out for the process
 	dayKey      string          // America/Los_Angeles date the counters belong to
+	startDay    string          // the quota day the process started on: its counters may miss earlier calls
+	calibrated  bool            // a call succeeded or a daily-quota 429 arrived since the process started
 	used        map[string]int  // successful (HTTP 200) calls today per model; in memory, resets on restart
 	limits      map[string]int  // per-day limit a 429 reported for a model today
 	modelOut    map[string]bool // models whose daily quota 429 was seen today
@@ -120,6 +122,7 @@ func NewClient(apiKey, model, fallbackModel string) *Client {
 		http:        &http.Client{Timeout: 90 * time.Second},
 		sleep:       time.Sleep,
 		now:         time.Now,
+		startDay:    time.Now().In(quotaLoc()).Format("2006-01-02"),
 		maxRPM:      DefaultMaxRPM,
 		dailyBudget: DefaultDailyBudget,
 		unavailable: map[string]bool{},
@@ -158,6 +161,25 @@ func (c *Client) rollDay(now time.Time) {
 		c.dayKey = key
 		c.used, c.limits, c.modelOut = map[string]int{}, map[string]int{}, map[string]bool{}
 	}
+}
+
+// usageKnownLocked reports whether the counters can be trusted as the day's
+// usage. They live in memory, so right after the process starts (a restart, a
+// Render wake-up) the day's earlier calls are unknown and are not assumed to be
+// zero. The service sleeps overnight and so starts fresh every morning; usage is
+// treated as known from the first successful call or the first daily-quota 429
+// of the day, which is the point where the count and Google's own answer begin to
+// agree, and from any later quota day. The per-symbol fallback does not wait for
+// this: the quota 429 and the fallback model protect against an over-spend.
+// Caller holds c.mu.
+func (c *Client) usageKnownLocked() bool { return c.calibrated || c.dayKey != c.startDay }
+
+// UsageKnown reports whether today's call counts are complete (see usageKnownLocked).
+func (c *Client) UsageKnown() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rollDay(c.now())
+	return c.usageKnownLocked()
 }
 
 // limitFor is the daily call limit for model: what a 429 reported today, else
@@ -279,13 +301,18 @@ func (c *Client) UsageByModel() []ModelUsage {
 	return out
 }
 
-// UsageSummary is UsageByModel on one line.
+// UsageSummary is UsageByModel on one line. While today's earlier usage is
+// unknown (the process started today) the counts are marked as a minimum.
 func (c *Client) UsageSummary() string {
 	var parts []string
 	for _, u := range c.UsageByModel() {
 		parts = append(parts, u.String())
 	}
-	return strings.Join(parts, ", ")
+	s := strings.Join(parts, ", ")
+	if !c.UsageKnown() {
+		s += " [no call yet since the process started: usage so far today is unknown, a 429 is the real limit]"
+	}
+	return s
 }
 
 // Usage returns the successful calls today and the daily limit of the model
@@ -309,8 +336,17 @@ func (c *Client) Usage() (used, budget int) {
 	return c.used[m], c.limitFor(m)
 }
 
-// Remaining is the number of calls left today across every usable model.
+// Remaining is the number of calls left today across every usable model,
+// by this process's own count.
 func (c *Client) Remaining() int {
+	n, _ := c.RemainingEstimate()
+	return n
+}
+
+// RemainingEstimate is Remaining plus whether it is exact. It is only an upper
+// bound while today's earlier usage is unknown (exact false): a caller must not
+// spend budget it cannot be sure exists.
+func (c *Client) RemainingEstimate() (calls int, exact bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rollDay(c.now())
@@ -320,7 +356,7 @@ func (c *Client) Remaining() int {
 			n += max(c.limitFor(m)-c.used[m], 0)
 		}
 	}
-	return n
+	return n, c.usageKnownLocked()
 }
 
 // pick chooses the model for a call of priority prio: the first one in the
@@ -389,6 +425,7 @@ func (c *Client) countCall(model string) {
 	defer c.mu.Unlock()
 	c.rollDay(c.now())
 	c.used[model]++
+	c.calibrated = true
 }
 
 // dropModel takes model out of the chain for the rest of the process.
@@ -410,6 +447,7 @@ func (c *Client) markModelOut(model string, q quotaInfo) {
 	c.rollDay(c.now())
 	first := !c.modelOut[model]
 	c.modelOut[model] = true
+	c.calibrated = true
 	if n, err := strconv.Atoi(strings.TrimSpace(q.Limit)); err == nil && n > 0 {
 		c.limits[model] = n
 		c.used[model] = max(c.used[model], n) // keep the counter in step with Google's

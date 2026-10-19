@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -15,28 +16,64 @@ import (
 )
 
 type orderRec struct {
-	symbol string
-	side   broker.Side
-	qty    int
-	kind   string  // "bracket", "oto" or "market"
-	stop   float64 // bracket / oto stop
+	symbol    string
+	side      broker.Side
+	qty       int
+	kind      string  // "bracket", "oto" or "market"
+	stop      float64 // bracket / oto stop
+	orderKind string  // the order kind: broker.KindEntry, KindExit or KindRebalance
 }
 
-type fakeOrders struct{ placed []orderRec }
+type fakeOrders struct {
+	placed []orderRec
+	// seen is the set of "SYMBOL side" orders already on the broker today: a second
+	// one is refused with broker.ErrDuplicateOrder, as the real client does.
+	seen map[string]bool
+	// cancelled counts CancelOpenOrders calls.
+	cancelled int
+}
 
-func (f *fakeOrders) PlaceBracketOrder(symbol string, qty int, side broker.Side, stop, _ float64) error {
-	f.placed = append(f.placed, orderRec{symbol, side, qty, "bracket", stop})
+func (f *fakeOrders) once(symbol string, side broker.Side) error {
+	key := symbol + " " + string(side)
+	if f.seen[key] {
+		return fmt.Errorf("%w: %s", broker.ErrDuplicateOrder, key)
+	}
 	return nil
 }
-func (f *fakeOrders) PlaceOTOOrder(symbol string, qty int, side broker.Side, stop float64) error {
-	f.placed = append(f.placed, orderRec{symbol, side, qty, "oto", stop})
+
+func (f *fakeOrders) record(symbol string, side broker.Side, qty int, kind string, stop float64, orderKind string) {
+	if f.seen == nil {
+		f.seen = map[string]bool{}
+	}
+	f.seen[symbol+" "+string(side)] = true
+	f.placed = append(f.placed, orderRec{symbol, side, qty, kind, stop, orderKind})
+}
+
+func (f *fakeOrders) PlaceBracketOrder(symbol string, qty int, side broker.Side, stop, _ float64, orderKind string) error {
+	if err := f.once(symbol, side); err != nil {
+		return err
+	}
+	f.record(symbol, side, qty, "bracket", stop, orderKind)
 	return nil
 }
-func (f *fakeOrders) PlaceMarketOrder(symbol string, qty int, side broker.Side) error {
-	f.placed = append(f.placed, orderRec{symbol, side, qty, "market", 0})
+func (f *fakeOrders) PlaceOTOOrder(symbol string, qty int, side broker.Side, stop float64, orderKind string) error {
+	if err := f.once(symbol, side); err != nil {
+		return err
+	}
+	f.record(symbol, side, qty, "oto", stop, orderKind)
 	return nil
 }
-func (f *fakeOrders) CancelOpenOrders(string) (int, error) { return 0, nil }
+func (f *fakeOrders) PlaceMarketOrder(symbol string, qty int, side broker.Side, orderKind string) error {
+	if err := f.once(symbol, side); err != nil {
+		return err
+	}
+	f.record(symbol, side, qty, "market", 0, orderKind)
+	return nil
+}
+func (f *fakeOrders) CancelOpenOrders(string) (int, error) { f.cancelled++; return 0, nil }
+func (f *fakeOrders) CheckOrder(symbol string, side broker.Side, _ string) error {
+	return f.once(symbol, side)
+}
 
 func (f *fakeOrders) symbols(side broker.Side) []string {
 	var out []string

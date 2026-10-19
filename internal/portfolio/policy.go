@@ -13,12 +13,13 @@ type Policy struct {
 	BondMin, BondMax     float64 // bond ETFs (non-T-bill)
 	CashMin, CashMax     float64 // cash + T-bill ETFs
 
-	MaxStockPct   float64 // single stock or equity ETF
-	MaxBondETFPct float64 // single bond ETF (T-bill ETFs included)
-	SectorMaxPct  float64 // one sector of the equity sleeve
-	CreditMaxPct  float64 // all credit-risk bond ETFs combined
-	MaxDuration   float64 // portfolio weighted bond duration, years
-	MinRealCash   float64 // always keep this much actual cash, % of equity
+	MaxStockPct    float64 // single stock or sector / thematic equity ETF
+	MaxBroadETFPct float64 // single diversified index ETF (SPY, QQQ...): it is not a single-name bet
+	MaxBondETFPct  float64 // single bond ETF (T-bill ETFs included)
+	SectorMaxPct   float64 // one sector of the equity sleeve
+	CreditMaxPct   float64 // all credit-risk bond ETFs combined
+	MaxDuration    float64 // portfolio weighted bond duration, years
+	MinRealCash    float64 // always keep this much actual cash, % of equity
 
 	// Target weights per sleeve, used to size bond purchases. The weekly
 	// review may move them inside the bands.
@@ -32,7 +33,7 @@ func DefaultPolicy() Policy {
 		EquityMin: 40, EquityMax: 75,
 		BondMin: 15, BondMax: 40,
 		CashMin: 5, CashMax: 30,
-		MaxStockPct: 10, MaxBondETFPct: 15, SectorMaxPct: 30, CreditMaxPct: 10, MaxDuration: 8, MinRealCash: 2,
+		MaxStockPct: 10, MaxBroadETFPct: 20, MaxBondETFPct: 15, SectorMaxPct: 30, CreditMaxPct: 10, MaxDuration: 8, MinRealCash: 2,
 		TargetEquity: 60, TargetBond: 30, TargetCash: 10,
 	}
 }
@@ -223,6 +224,8 @@ func (p Policy) Room(b Book, symbol, sector string) (room float64, binding strin
 	cur := b.holdingValue(symbol)
 	if isBond {
 		limit(pct(p.MaxBondETFPct)-cur, fmt.Sprintf("single bond ETF limit %.0f%%", p.MaxBondETFPct))
+	} else if IsBroadETF(symbol) {
+		limit(pct(p.MaxBroadETFPct)-cur, fmt.Sprintf("single index ETF limit %.0f%%", p.MaxBroadETFPct))
 	} else {
 		limit(pct(p.MaxStockPct)-cur, fmt.Sprintf("single position limit %.0f%%", p.MaxStockPct))
 	}

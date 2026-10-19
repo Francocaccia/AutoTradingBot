@@ -95,5 +95,11 @@ func parseClock(date, hhmm string) (time.Time, error) {
 // EntryWindowOpen reports whether new positions may be opened: not within
 // `buffer` after the open or before the close.
 func EntryWindowOpen(now, open, closeT time.Time, buffer time.Duration) bool {
-	return !now.Before(open.Add(buffer)) && now.Before(closeT.Add(-buffer))
+	return EntryWindowOpenAsym(now, open, closeT, buffer, buffer)
+}
+
+// EntryWindowOpenAsym is EntryWindowOpen with separate blackouts after the open
+// and before the close.
+func EntryWindowOpenAsym(now, open, closeT time.Time, afterOpen, beforeClose time.Duration) bool {
+	return !now.Before(open.Add(afterOpen)) && now.Before(closeT.Add(-beforeClose))
 }

@@ -20,6 +20,7 @@ type fakeLLM struct {
 	singleCalls  []string
 	singleErr    error
 	remaining    int
+	unknown      bool // today's earlier Gemini usage is unknown (RemainingEstimate not exact)
 	reviews      int
 	review       *gemini.Review
 	reviewErr    error
@@ -39,7 +40,7 @@ func (f *fakeLLM) DecideAt(prompt string, prio gemini.Priority) (*gemini.Decisio
 	return &gemini.Decision{Action: "HOLD", Conviction: 5, Thesis: "single"}, nil
 }
 
-func (f *fakeLLM) Remaining() int { return f.remaining }
+func (f *fakeLLM) RemainingEstimate() (int, bool) { return f.remaining, !f.unknown }
 
 func (f *fakeLLM) Review(string) (*gemini.Review, error) {
 	f.reviews++
@@ -205,6 +206,25 @@ func TestBatchFailureFallsBackPerSymbolOnlyWithBudget(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "skipping this cycle") || !strings.Contains(logs.String(), "falling back to one call per symbol") {
 		t.Errorf("expected both decisions logged:\n%s", logs)
+	}
+}
+
+// The service restarts every morning, so "unknown usage" is the normal start of
+// the day. The per-symbol fallback stays enabled: a 429 and the fallback model
+// stop an over-spend, while skipping would leave held positions unreviewed.
+func TestBatchFailureStillFallsBackPerSymbolWhileUsageIsUnknown(t *testing.T) {
+	logs := captureSchedLog(t)
+	s, _ := newTestScheduler(Config{})
+	f := &fakeLLM{batchErr: errors.New("gemini HTTP 503: overloaded"), remaining: 36, unknown: true}
+	s.llm = f
+	cs := newCycle()
+	cs.pf = nil
+	s.runBatch(cs, []*batchEntry{entry("AAA", gemini.PrioCore), entry("BBB", gemini.PrioCore)})
+	if len(f.singleCalls) != 2 {
+		t.Errorf("%d per-symbol calls with unknown usage, want 2", len(f.singleCalls))
+	}
+	if !strings.Contains(logs.String(), "falling back to one call per symbol") {
+		t.Errorf("the fallback is not logged:\n%s", logs)
 	}
 }
 

@@ -86,13 +86,17 @@ func TestResolveBondModeAutoUsesETFsWhenNativeIsUnsupported(t *testing.T) {
 func TestPlaceOTOOrderBody(t *testing.T) {
 	var got string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet { // the duplicate check
+			w.Write([]byte(`[]`))
+			return
+		}
 		b := make([]byte, 512)
 		n, _ := r.Body.Read(b)
 		got = string(b[:n])
 		w.Write([]byte(`{}`))
 	}))
 	defer srv.Close()
-	if err := NewAlpacaClient("k", "s", srv.URL).PlaceOTOOrder("SHY", 50, Buy, 82.1); err != nil {
+	if err := NewAlpacaClient("k", "s", srv.URL).PlaceOTOOrder("SHY", 50, Buy, 82.1, KindEntry); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{`"order_class":"oto"`, `"stop_price":"82.10"`, `"time_in_force":"gtc"`, `"symbol":"SHY"`} {

@@ -12,7 +12,7 @@ import (
 //
 //	IPS_EQUITY_MIN / IPS_EQUITY_MAX   IPS_BOND_MIN / IPS_BOND_MAX   IPS_CASH_MIN / IPS_CASH_MAX
 //	IPS_TARGET_EQUITY / IPS_TARGET_BOND / IPS_TARGET_CASH
-//	IPS_MAX_BOND_ETF_PCT  IPS_SECTOR_MAX_PCT  IPS_CREDIT_MAX_PCT  IPS_MAX_DURATION  IPS_MIN_REAL_CASH_PCT
+//	IPS_MAX_BROAD_ETF_PCT  IPS_MAX_BOND_ETF_PCT  IPS_SECTOR_MAX_PCT  IPS_CREDIT_MAX_PCT  IPS_MAX_DURATION  IPS_MIN_REAL_CASH_PCT
 //
 // maxStockPct (MAX_POSITION_PCT) is the single-stock limit.
 func PolicyFromEnv(getenv func(string) string, maxStockPct float64) (Policy, []string) {
@@ -29,7 +29,7 @@ func PolicyFromEnv(getenv func(string) string, maxStockPct float64) (Policy, []s
 		{"IPS_BOND_MIN", &p.BondMin}, {"IPS_BOND_MAX", &p.BondMax},
 		{"IPS_CASH_MIN", &p.CashMin}, {"IPS_CASH_MAX", &p.CashMax},
 		{"IPS_TARGET_EQUITY", &p.TargetEquity}, {"IPS_TARGET_BOND", &p.TargetBond}, {"IPS_TARGET_CASH", &p.TargetCash},
-		{"IPS_MAX_BOND_ETF_PCT", &p.MaxBondETFPct}, {"IPS_SECTOR_MAX_PCT", &p.SectorMaxPct},
+		{"IPS_MAX_BROAD_ETF_PCT", &p.MaxBroadETFPct}, {"IPS_MAX_BOND_ETF_PCT", &p.MaxBondETFPct}, {"IPS_SECTOR_MAX_PCT", &p.SectorMaxPct},
 		{"IPS_CREDIT_MAX_PCT", &p.CreditMaxPct}, {"IPS_MAX_DURATION", &p.MaxDuration},
 		{"IPS_MIN_REAL_CASH_PCT", &p.MinRealCash},
 	}

@@ -380,51 +380,33 @@ func session(day, hhmm string) *market.Session {
 	return &market.Session{Now: tm, Date: day, IsOpen: true, TradingDay: true}
 }
 
-func TestReviewRunsMondayAfter1000OrOnBandBreach(t *testing.T) {
+func TestWeeklyReviewRunsOnlyOnMondayAfter1000(t *testing.T) {
 	s, _ := newTestScheduler(baseConfig())
 	cs := newCycle()
 	withRegime(cs, true)
-	withAccount(s, cs, 100_000, 100_000) // 100% cash: 70 points over its band max
+	withAccount(s, cs, 100_000, 100_000) // 100% cash: 70 points over its band max, which no longer triggers anything here
 	hold(cs, "X", 0)
 	delete(cs.positions, "X")
 
 	// 2026-10-12 is a Monday.
-	if r := s.reviewReason(cs, session("2026-10-12", "09:45")); r != "" && !strings.HasPrefix(r, "band breach") {
-		t.Errorf("Monday before 10:00: %q", r)
+	if r, why := s.reviewDecision(cs, session("2026-10-12", "09:45")); r != "" || !strings.Contains(why, "before 10:00") {
+		t.Errorf("nothing runs before 10:00, got %q (%q)", r, why)
 	}
-	if r := s.reviewReason(cs, session("2026-10-12", "09:45")); r != "" {
-		t.Errorf("nothing runs before 10:00, got %q", r)
-	}
-	if r := s.reviewReason(cs, session("2026-10-12", "10:00")); r != "weekly review" {
+	if r, _ := s.reviewDecision(cs, session("2026-10-12", "10:00")); r != "weekly review" {
 		t.Errorf("Monday 10:00: %q", r)
 	}
 	s.lastReviewDay = "2026-10-12"
-	if r := s.reviewReason(cs, session("2026-10-12", "11:00")); r != "" {
-		t.Errorf("already reviewed today: %q", r)
+	if r, why := s.reviewDecision(cs, session("2026-10-12", "11:00")); r != "" || !strings.Contains(why, "already ran") {
+		t.Errorf("already reviewed today: %q (%q)", r, why)
 	}
-	// Tuesday: only a band breach triggers, and only once that day.
-	if r := s.reviewReason(cs, session("2026-10-13", "10:30")); !strings.HasPrefix(r, "band breach") {
-		t.Errorf("Tuesday with cash far over its band: %q", r)
+	// Tuesday: a band breach does not call the model any more; the policy
+	// rebalancing (rebalance.go) handles bands in plain code.
+	if r, why := s.reviewDecision(cs, session("2026-10-13", "10:30")); r != "" || !strings.Contains(why, "Mondays") {
+		t.Errorf("Tuesday with cash far over its band: %q (%q)", r, why)
 	}
-	s.lastBandReviewDay = "2026-10-13"
-	if r := s.reviewReason(cs, session("2026-10-13", "11:30")); r != "" {
-		t.Errorf("one band review per day: %q", r)
-	}
-
-	// Cash inside its band is not a reason, and neither is a breach under 5 points.
-	s2, _ := newTestScheduler(baseConfig())
-	cs2 := newCycle()
-	withRegime(cs2, true)
-	hold(cs2, "SPY", 55_000)
-	hold(cs2, "IEF", 15_000)
-	withAccount(s2, cs2, 100_000, 30_000)
-	if r := s2.reviewReason(cs2, session("2026-10-13", "10:30")); r != "" {
-		t.Errorf("balanced book on a Tuesday: %q", r)
-	}
-	hold(cs2, "SPY", 55_000)
-	withAccount(s2, cs2, 100_000, 28_000) // cash 28%, equities 55%, bonds 15%: all in band
-	if r := s2.reviewReason(cs2, session("2026-10-13", "10:30")); r != "" {
-		t.Errorf("in-band book: %q", r)
+	cs.pf = nil
+	if r, why := s.reviewDecision(cs, session("2026-10-12", "10:30")); r != "" || !strings.Contains(why, "unavailable") {
+		t.Errorf("no portfolio context: %q (%q)", r, why)
 	}
 }
 

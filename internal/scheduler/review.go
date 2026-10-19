@@ -15,86 +15,40 @@ import (
 // maxReviewActions is how many of the review's recommended actions are considered.
 const maxReviewActions = 2
 
-// reviewReason says why a portfolio review should run now ("" = not now). It
-// runs on the first eligible cycle on Monday after 10:00 ET, or once a day when
-// a sleeve is more than reviewBreachPts outside its band. Cash inside its band
-// is never a reason.
-func (s *Scheduler) reviewReason(cs *cycleState, sess *market.Session) string {
-	reason, _ := s.reviewDecision(cs, sess)
-	return reason
-}
-
-// reviewDecision is reviewReason plus, when the review is not due, why not.
+// reviewDecision says whether the weekly portfolio review (one Gemini call)
+// should run now: on the first eligible cycle on Monday after 10:00 ET. Bringing
+// a sleeve back inside its band is not its job: the investment-policy
+// rebalancing (rebalance.go) does that with plain code, every cycle, without the
+// model. When the review is not due, notDue says why.
 func (s *Scheduler) reviewDecision(cs *cycleState, sess *market.Session) (reason, notDue string) {
 	switch {
 	case cs.pf == nil:
 		return "", "portfolio context unavailable"
 	case sess.Now.Hour() < entryReviewHour:
 		return "", fmt.Sprintf("not due: before %d:00 ET", entryReviewHour)
-	// At most one review per process per day, whatever triggered it.
 	case s.lastReviewDay == sess.Date:
-		return "", "already ran today (weekly review)"
-	case s.lastBandReviewDay == sess.Date:
-		return "", "already ran today (band-breach review)"
+		return "", "already ran today"
 	case sess.Now.Weekday() == time.Monday:
 		return "weekly review", ""
 	}
-	pts, desc := s.policy.BandBreach(s.bookFrom(cs, cs.account))
-	if pts > reviewBreachPts {
-		return fmt.Sprintf("band breach of %.1f points (%s)", pts, desc), ""
-	}
-	return "", fmt.Sprintf("not due: not Monday and the largest band breach is %.1f points (trigger: more than %.0f)", pts, reviewBreachPts)
+	return "", "not due: runs on Mondays"
 }
 
-// reviewSkipLine is the one line logged on every cycle the review does not run:
-// the reason, and where cash stands against its band when that is known.
-func (s *Scheduler) reviewSkipLine(why string, cashPct float64, haveCash bool) string {
-	line := "[Review] not run: " + why
-	if haveCash {
-		line += fmt.Sprintf(" | cash %.1f%% of equity, band %.0f-%.0f%%", cashPct, s.policy.CashMin, s.policy.CashMax)
-	}
-	return line
-}
-
-// logReviewSkip logs the skip line using the cycle's cash sleeve weight.
-func (s *Scheduler) logReviewSkip(cs *cycleState, why string) {
-	if cs != nil && cs.account != nil && cs.account.Equity > 0 {
-		w := s.bookFrom(cs, cs.account).SleeveWeights()[portfolio.SleeveCash]
-		log.Print(s.reviewSkipLine(why, w, true))
-		return
-	}
-	log.Print(s.reviewSkipLine(why, 0, false))
-}
-
-// logEarlySkip logs the review skip line for a cycle that ended before the
-// account was loaded (market closed, scheduler paused, Gemini paused). Cash is
-// read from a best-effort account fetch and left out if that fails.
-func (s *Scheduler) logEarlySkip(why string) {
-	if s.acct != nil {
-		if acct, err := s.acct.GetAccount(); err == nil && acct != nil && acct.Equity > 0 {
-			log.Print(s.reviewSkipLine(why, acct.Cash/acct.Equity*100, true))
-			return
-		}
-	}
-	log.Print(s.reviewSkipLine(why, 0, false))
-}
-
-// maybeReview runs the portfolio review (one Gemini call) when due and queues
-// its approved actions as ordinary decisions, which then go through every guard.
-// Every cycle in which it does not run logs one line saying why.
+// maybeReview runs the weekly portfolio review when due and queues its approved
+// actions as ordinary decisions, which then go through every guard. A review
+// that is due but cannot run says why in the cycle's [Review] line.
 func (s *Scheduler) maybeReview(cs *cycleState, sess *market.Session) {
-	reason, notDue := s.reviewDecision(cs, sess)
+	reason, _ := s.reviewDecision(cs, sess)
 	if reason == "" {
-		s.logReviewSkip(cs, notDue)
-		return
+		return // not due: not worth a word in the cycle's line
 	}
 	if cs.stopGemini {
-		s.logReviewSkip(cs, reason+" is due, but Gemini quota/budget ran out earlier this cycle")
+		cs.why(reason + " is due, but Gemini is unavailable this cycle")
 		return
 	}
 	// A review whose orders would all be refused by the turnover caps is not worth a call.
 	if !cs.breaker && cs.history != nil && !s.capRoom(cs, 1) {
-		s.logReviewSkip(cs, fmt.Sprintf("%s is due, but the trade cap is reached (today %d/%s, week %d/%s)",
+		cs.why(fmt.Sprintf("%s is due, but the trade cap is reached (today %d/%s, week %d/%s)",
 			reason, cs.tradesDay, capLabel(s.cfg.MaxTradesPerDay), cs.tradesWeek, capLabel(s.cfg.MaxTradesPerWeek)))
 		return
 	}
@@ -105,19 +59,15 @@ func (s *Scheduler) maybeReview(cs *cycleState, sess *market.Session) {
 		pausedFn = s.cfg.Gemini.Paused
 	}
 	if pausedFn == nil || s.llm == nil {
-		s.logReviewSkip(cs, reason+" is due, but no Gemini client is configured")
+		cs.why(reason + " is due, but no Gemini client is configured")
 		return
 	}
 	if paused, why := pausedFn(); paused {
-		s.logReviewSkip(cs, fmt.Sprintf("%s is due, but Gemini is paused (%s)", reason, why))
+		cs.why(fmt.Sprintf("%s is due, but Gemini is paused (%s)", reason, why))
 		return
 	}
 	// Mark the day before calling so a failing call is not retried every cycle.
-	if strings.HasPrefix(reason, "weekly") {
-		s.lastReviewDay = sess.Date
-	} else {
-		s.lastBandReviewDay = sess.Date
-	}
+	s.lastReviewDay = sess.Date
 
 	block := analysis.Render(cs.pf.in, nil)
 	var options []gemini.BondOption
@@ -127,16 +77,18 @@ func (s *Scheduler) maybeReview(cs *cycleState, sess *market.Session) {
 		}
 		options = append(options, gemini.BondOption{Symbol: b.Symbol, Kind: b.Kind, Duration: b.Duration, Credit: b.Credit, CashLike: b.CashLike})
 	}
-	prompt := gemini.BuildReviewPrompt(gemini.ReviewInput{Portfolio: block, Reason: reason, Bonds: options, EquityETFs: s.reviewEquityETFs(), Held: heldSymbols(cs)})
+	prompt := gemini.BuildReviewPrompt(gemini.ReviewInput{Portfolio: block, Reason: reason, Bonds: options, EquityETFs: s.reviewEquityETFs(),
+		Held: heldSymbols(cs), BandsFilledByBot: s.bandsMode() == bandsGradual})
 	r, err := s.llm.Review(prompt)
 	if err != nil {
 		if stopOnQuota(cs, err) {
 			// No budget for the review: the day is free to retry on a later cycle.
-			s.lastReviewDay, s.lastBandReviewDay = "", ""
-			s.logReviewSkip(cs, fmt.Sprintf("%s is due, but there is no Gemini budget (%v)", reason, err))
+			s.lastReviewDay = ""
+			cs.why(fmt.Sprintf("%s is due, but there is no Gemini budget (%v)", reason, err))
 			return
 		}
-		log.Printf("[Review] %s: Gemini error: %v", reason, err)
+		log.Printf("[WeeklyReview] %s: Gemini error: %v", reason, err)
+		cs.why(fmt.Sprintf("%s: Gemini error", reason))
 		return
 	}
 	s.applyReview(reason, r, cs, block)
@@ -160,17 +112,6 @@ func (s *Scheduler) applyReview(reason string, r *gemini.Review, cs *cycleState,
 		}
 	}
 
-	// A book far outside its bands is rebalanced with code-set catalysts, stepwise.
-	var breach portfolio.Breach
-	if cs.account != nil {
-		breach = s.policy.WorstBreach(s.bookFrom(cs, cs.account))
-	}
-	rebalance := breach.Pts > reviewBreachPts
-	if rebalance {
-		log.Printf("[Rebalance] %s: %.1f points outside the band; closing it in steps of at most %.0f%% of equity and %s trades a day",
-			breach.Catalyst(), breach.Pts, bondStepPct, capLabel(s.cfg.MaxTradesPerDay))
-	}
-
 	var queued, rejected []string
 	for i, a := range r.Actions {
 		if i >= maxReviewActions {
@@ -178,11 +119,6 @@ func (s *Scheduler) applyReview(reason string, r *gemini.Review, cs *cycleState,
 			continue
 		}
 		p, why := s.reviewAction(a, cs, block)
-		if why == "" && rebalance && a.Action == "BUY" {
-			// The code states the catalyst; the model's quote is not checked. The
-			// portfolio_rationale is still required by the normal guards.
-			p.decision.Catalyst, p.rebalance = breach.Catalyst(), true
-		}
 		if why != "" {
 			rejected = append(rejected, fmt.Sprintf("%s %s (%s)", a.Action, a.Symbol, why))
 			continue
@@ -190,8 +126,21 @@ func (s *Scheduler) applyReview(reason string, r *gemini.Review, cs *cycleState,
 		cs.pending = append(cs.pending, p)
 		queued = append(queued, fmt.Sprintf("%s %s", a.Action, a.Symbol))
 	}
-	log.Printf("[Review] %s: %s | actions queued: %s | rejected: %s | %s",
+	log.Printf("[WeeklyReview] %s: %s | actions queued: %s | rejected: %s | %s",
 		reason, targets, orNone(queued), orNone(rejected), r.Summary)
+	if len(queued) == 0 {
+		cs.why(fmt.Sprintf("%s ran: no action proposed (%s)", reason, truncateWords(r.Summary, 80)))
+	}
+}
+
+// truncateWords shortens s to at most n runes for a log field.
+func truncateWords(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }
 
 func orNone(l []string) string {

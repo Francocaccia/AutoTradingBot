@@ -278,3 +278,28 @@ func TestFillsReadsClientOrderFields(t *testing.T) {
 		t.Errorf("fields not carried through: %+v", fills)
 	}
 }
+
+func TestRebalanceCountsComeFromTheClientOrderID(t *testing.T) {
+	buy := func(sym, id, at string) Fill {
+		return Fill{Symbol: sym, Side: "buy", Type: "market", OrderClass: "oto", At: et(t, at), Qty: 5, ClientOrderID: id}
+	}
+	s := snap(t,
+		buy("AGG", "atb-20261015-AGG-buy-rebalance", "2026-10-15 10:30"),                                                                                       // today
+		buy("SPY", "atb-20261013-SPY-buy-rebalance", "2026-10-13 10:30"),                                                                                       // this week
+		buy("SHY", "atb-20261008-SHY-buy-rebalance", "2026-10-08 10:30"),                                                                                       // outside the 5-trading-day window
+		buy("MSFT", "atb-20261015-MSFT-buy-entry", "2026-10-15 10:31"),                                                                                         // an ordinary entry
+		buy("QQQ", "atb-3f2a9c1d0e8b7a6f5d4c3b2a", "2026-10-15 10:32"),                                                                                         // legacy random id
+		Fill{Symbol: "AGG", Side: "sell", Type: "stop", ParentID: "p", At: et(t, "2026-10-15 12:00"), Qty: 5, ClientOrderID: "atb-20261015-AGG-buy-rebalance"}, // a leg never counts
+	)
+	today, week := s.RebalanceCounts()
+	if today != 1 || week != 2 {
+		t.Errorf("rebalance today/week = %d/%d, want 1/2", today, week)
+	}
+	// Policy trades are decisions as well: they count toward the shared caps.
+	if dt, dw := s.DecisionCounts(); dt != 3 || dw != 4 {
+		t.Errorf("decision today/week = %d/%d, want 3/4", dt, dw)
+	}
+	if k := (Fill{ClientOrderID: "atb-20261015-AGG-buy-rebalance"}).Kind(); k != broker.KindRebalance {
+		t.Errorf("kind = %q", k)
+	}
+}

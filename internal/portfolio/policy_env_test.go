@@ -21,6 +21,28 @@ func TestPolicyFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestBroadETFHasItsOwnSingleNameLimit(t *testing.T) {
+	p, _ := PolicyFromEnv(env(nil), 10)
+	if p.MaxBroadETFPct != 20 || p.MaxStockPct != 10 {
+		t.Fatalf("defaults: %+v", p)
+	}
+	b := Book{Equity: 100_000, Cash: 60_000, Holdings: []Holding{{Symbol: "SPY", Value: 15_000}, {Symbol: "AAPL", Value: 9_000}, {Symbol: "XYZ", Value: 16_000, Sector: "Tech"}}}
+	// An index ETF may grow to 20%, a stock stops at 10%.
+	if room, bind := p.Room(b, "SPY", ""); room != 5_000 || !strings.Contains(bind, "index ETF") {
+		t.Errorf("SPY room %.0f binding %q", room, bind)
+	}
+	if room, bind := p.Room(b, "AAPL", "Tech"); room != 1_000 || !strings.Contains(bind, "single position") {
+		t.Errorf("AAPL room %.0f binding %q", room, bind)
+	}
+	if room, _ := p.Room(b, "QQQ", ""); room != 20_000 {
+		t.Errorf("QQQ room %.0f", room)
+	}
+	p, _ = PolicyFromEnv(env(map[string]string{"IPS_MAX_BROAD_ETF_PCT": "12"}), 10)
+	if p.MaxBroadETFPct != 12 {
+		t.Errorf("override: %+v", p)
+	}
+}
+
 func TestPolicyFromEnvRejectsBadValuesAndIncoherentBands(t *testing.T) {
 	p, warn := PolicyFromEnv(env(map[string]string{"IPS_EQUITY_MAX": "abc", "IPS_BOND_MIN": "-3"}), 10)
 	if len(warn) != 2 || p.EquityMax != 75 || p.BondMin != 15 {

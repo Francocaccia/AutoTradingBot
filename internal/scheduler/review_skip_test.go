@@ -1,40 +1,22 @@
 package scheduler
 
 import (
-	"errors"
-	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/francocaccia/quantengine/internal/gemini"
+	"github.com/francocaccia/quantengine/internal/portfolio"
 )
 
-// reviewSkipLog runs maybeReview and returns the [Review] log lines.
-func reviewSkipLog(t *testing.T, s *Scheduler, cs *cycleState, day, hhmm string) []string {
+// field returns the " | "-separated field of a [Review] line that starts with prefix.
+func field(t *testing.T, line, prefix string) string {
 	t.Helper()
-	logs := captureSchedLog(t)
-	s.maybeReview(cs, session(day, hhmm))
-	var out []string
-	for _, l := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
-		if strings.Contains(l, "[Review]") {
-			out = append(out, l)
+	for _, f := range strings.Split(line, " | ") {
+		if strings.HasPrefix(f, prefix) {
+			return f
 		}
 	}
-	return out
-}
-
-// wantOneSkipLine checks that exactly one "not run" line was logged, with the
-// reason and the cash position against its band.
-func wantOneSkipLine(t *testing.T, lines []string, reason string) {
-	t.Helper()
-	if len(lines) != 1 {
-		t.Fatalf("want exactly one [Review] line, got %d: %v", len(lines), lines)
-	}
-	for _, want := range []string{"[Review] not run: ", reason, "cash ", "of equity, band 5-30%"} {
-		if !strings.Contains(lines[0], want) {
-			t.Errorf("line %q missing %q", lines[0], want)
-		}
-	}
+	t.Fatalf("line has no %q field: %s", prefix, line)
+	return ""
 }
 
 func balancedCycle(s *Scheduler) *cycleState {
@@ -46,120 +28,140 @@ func balancedCycle(s *Scheduler) *cycleState {
 	return cs
 }
 
-func TestReviewSkipNotDue(t *testing.T) {
+func TestReviewLineCarriesEveryField(t *testing.T) {
 	s, _ := newTestScheduler(baseConfig())
-	cs := balancedCycle(s)
-	lines := reviewSkipLog(t, s, cs, "2026-10-13", "10:30") // a Tuesday
-	wantOneSkipLine(t, lines, "not due: not Monday")
-	if !strings.Contains(lines[0], "cash 30.0% of equity") {
-		t.Errorf("cash sleeve not shown: %s", lines[0])
+	cs := rebalanceCycle(s) // equities 31%, bonds 0%, cash 69%
+	withRegime(cs, true)
+	cs.pf.regime.Label = "risk-off, inverted curve"
+	cs.why("rebalance: one trade per day already made (today 1)")
+
+	line := s.reviewLine(cs, session("2026-10-16", "10:15"))
+	if !strings.HasPrefix(line, "[Review] ts=2026-10-16 10:15 ") {
+		t.Errorf("timestamp: %s", line)
 	}
-}
-
-func TestReviewSkipBeforeTenAM(t *testing.T) {
-	s, _ := newTestScheduler(baseConfig())
-	lines := reviewSkipLog(t, s, rebalanceCycle(s), "2026-10-12", "09:45")
-	wantOneSkipLine(t, lines, "before 10:00 ET")
-	if !strings.Contains(lines[0], "cash 69.0% of equity") {
-		t.Errorf("cash sleeve not shown: %s", lines[0])
-	}
-}
-
-func TestReviewSkipAlreadyRanToday(t *testing.T) {
-	s, _ := newTestScheduler(baseConfig())
-	s.lastReviewDay = "2026-10-12"
-	wantOneSkipLine(t, reviewSkipLog(t, s, rebalanceCycle(s), "2026-10-12", "11:00"), "already ran today (weekly review)")
-
-	s, _ = newTestScheduler(baseConfig())
-	s.lastBandReviewDay = "2026-10-13"
-	wantOneSkipLine(t, reviewSkipLog(t, s, rebalanceCycle(s), "2026-10-13", "11:00"), "already ran today (band-breach review)")
-}
-
-func TestReviewSkipGeminiPaused(t *testing.T) {
-	s, _ := newTestScheduler(baseConfig())
-	s.llm = &fakeLLM{}
-	s.geminiPaused = func() (bool, string) { return true, "daily call budget used" }
-	lines := reviewSkipLog(t, s, rebalanceCycle(s), "2026-10-12", "11:00")
-	wantOneSkipLine(t, lines, "Gemini is paused (daily call budget used)")
-	if s.lastReviewDay != "" {
-		t.Error("a skipped review must not consume the day")
-	}
-}
-
-func TestReviewSkipGeminiStoppedEarlierThisCycle(t *testing.T) {
-	s, _ := newTestScheduler(baseConfig())
-	cs := rebalanceCycle(s)
-	cs.stopGemini = true
-	wantOneSkipLine(t, reviewSkipLog(t, s, cs, "2026-10-12", "11:00"), "quota/budget ran out earlier this cycle")
-}
-
-func TestReviewSkipTradeCapReached(t *testing.T) {
-	s, _ := newTestScheduler(baseConfig())
-	cs := rebalanceCycle(s)
-	cs.tradesDay = 2 // MaxTradesPerDay in baseConfig
-	lines := reviewSkipLog(t, s, cs, "2026-10-12", "11:00")
-	wantOneSkipLine(t, lines, "trade cap is reached (today 2/2")
-	if s.lastReviewDay != "" {
-		t.Error("a skipped review must not consume the day")
-	}
-
-	// A circuit-breaker cycle is exempt from the caps, so the review is not held back by them.
-	s, _ = newTestScheduler(baseConfig())
-	cs = rebalanceCycle(s)
-	cs.tradesDay, cs.breaker = 2, true
-	for _, l := range reviewSkipLog(t, s, cs, "2026-10-12", "11:00") {
-		if strings.Contains(l, "trade cap") {
-			t.Errorf("breaker cycle skipped for the cap: %s", l)
+	for _, want := range []string{
+		"regime=risk-off, inverted curve",
+		"equities 31.0% (band 40-75%, below min)",
+		"bonds 0.0% (band 15-40%, below min)",
+		"cash 69.0% (band 5-30%, above max)",
+		"mode=gradual",
+		"action=none",
+		"skip=rebalance: one trade per day already made (today 1)",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("line lacks %q:\n%s", want, line)
 		}
 	}
-}
-
-func TestReviewSkipNoBudgetWhenTheCallIsRefused(t *testing.T) {
-	// The client itself refuses the call (budget for the review priority is
-	// spent) although it is not paused for every priority.
-	s, _ := newTestScheduler(baseConfig())
-	cs := rebalanceCycle(s)
-	s.llm = &fakeLLM{reviewErr: fmt.Errorf("%w: m has 17/18 calls used today, review priority stops at 17", gemini.ErrBudgetExhausted)}
-	s.geminiPaused = func() (bool, string) { return false, "" }
-	lines := reviewSkipLog(t, s, cs, "2026-10-12", "11:00")
-	wantOneSkipLine(t, lines, "no Gemini budget")
-	if s.lastReviewDay != "" || !cs.stopGemini {
-		t.Errorf("the day must stay free for a later cycle (lastReviewDay=%q) and the cycle must stop Gemini (%v)", s.lastReviewDay, cs.stopGemini)
+	if strings.Contains(line, "\n") {
+		t.Error("the review line is one line")
 	}
 }
 
-func TestReviewRunDoesNotLogANotRunLine(t *testing.T) {
+func TestReviewLineInBandAndNothingToSay(t *testing.T) {
 	s, _ := newTestScheduler(baseConfig())
-	f := &fakeLLM{reviewErr: errors.New("gemini HTTP 503: overloaded")}
-	s.llm = f
-	s.geminiPaused = func() (bool, string) { return false, "" }
-	cs := rebalanceCycle(s)
+	cs := balancedCycle(s)
+	line := s.reviewLine(cs, session("2026-10-13", "10:30"))
+	for _, want := range []string{"equities 55.0% (band 40-75%, in band)", "bonds 15.0% (band 15-40%, in band)", "cash 30.0% (band 5-30%, in band)", "action=none"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("line lacks %q:\n%s", want, line)
+		}
+	}
+	// Never silent: with no reason on record the line still says something.
+	if got := field(t, line, "skip="); got == "skip=" || got == "skip=-" {
+		t.Errorf("a cycle that did nothing needs a skip reason, got %q", got)
+	}
+}
+
+func TestReviewLineActionsAreOrderedAndHaveNoSkip(t *testing.T) {
+	s, _ := newTestScheduler(baseConfig())
+	cs := balancedCycle(s)
+	cs.took("sell")
+	cs.took("rebalance")
+	cs.took("buy")
+	cs.took("buy")
+	cs.why("this reason is irrelevant once something happened")
+	line := s.reviewLine(cs, session("2026-10-13", "10:30"))
+	if field(t, line, "action=") != "action=rebalance+buy+sell" || field(t, line, "skip=") != "skip=-" {
+		t.Errorf("line: %s", line)
+	}
+}
+
+func TestReviewLineRegimeUnavailable(t *testing.T) {
+	s, _ := newTestScheduler(baseConfig())
+	cs := newCycle()
+	withAccount(s, cs, 100_000, 100_000)
+	cs.pf = nil
+	if line := s.reviewLine(cs, session("2026-10-13", "10:30")); !strings.Contains(line, "regime=unavailable") {
+		t.Errorf("line: %s", line)
+	}
+	// No account at all (a cycle that ended early): still a line.
+	line := s.reviewLine(&cycleState{whyNot: []string{"market closed"}}, nil)
+	if !strings.Contains(line, "allocation unavailable") || !strings.Contains(line, "skip=market closed") || !strings.HasPrefix(line, "[Review] ts=") {
+		t.Errorf("line: %s", line)
+	}
+}
+
+func TestReviewLineShowsTheConfiguredMode(t *testing.T) {
+	for _, mode := range []string{"gradual", "advisory", "off"} {
+		cfg := baseConfig()
+		cfg.IPSBandsMode = mode
+		s, _ := newTestScheduler(cfg)
+		if line := s.reviewLine(newCycle(), session("2026-10-13", "10:30")); !strings.Contains(line, "mode="+mode) {
+			t.Errorf("mode %s: %s", mode, line)
+		}
+	}
+	// Unset or unknown values read as the default.
+	s, _ := newTestScheduler(baseConfig())
+	if s.bandsMode() != bandsGradual {
+		t.Errorf("default mode = %q", s.bandsMode())
+	}
+	s.cfg.IPSBandsMode = "nonsense"
+	if s.bandsMode() != bandsGradual {
+		t.Errorf("unknown mode = %q", s.bandsMode())
+	}
+}
+
+// logEarlyReview is the line of a cycle that ended before the account was read.
+type fakePositions struct {
+	list []portfolio.Position
+	err  error
+}
+
+func (f fakePositions) GetAllPositions() ([]portfolio.Position, error) { return f.list, f.err }
+
+func TestEarlyCycleLogsExactlyOneLineWithTheAllocation(t *testing.T) {
+	s, _ := newTestScheduler(baseConfig())
+	s.acct = fakeAcct{portfolio.Account{Equity: 100_000, Cash: 69_000, BuyingPower: 69_000}}
+	s.pos = fakePositions{list: []portfolio.Position{{Symbol: "AAPL", Qty: 100, MarketVal: 31_000}}}
 	logs := captureSchedLog(t)
-	s.maybeReview(cs, session("2026-10-12", "11:00"))
-	if f.reviews != 1 {
-		t.Fatalf("the review should have been called once, got %d", f.reviews)
+	s.logEarlyReview(session("2026-10-16", "12:00"), "scheduler paused")
+	lines := reviewLines(logs.String())
+	if len(lines) != 1 {
+		t.Fatalf("want exactly one [Review] line, got %d: %v", len(lines), lines)
 	}
-	if strings.Contains(logs.String(), "not run") || !strings.Contains(logs.String(), "[Review] weekly review: Gemini error") {
-		t.Errorf("a review that ran logs its own outcome, not a skip line:\n%s", logs)
+	for _, want := range []string{"equities 31.0% (band 40-75%, below min)", "cash 69.0% (band 5-30%, above max)", "action=none", "skip=scheduler paused"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("line lacks %q:\n%s", want, lines[0])
+		}
 	}
-	if s.lastReviewDay != "2026-10-12" {
-		t.Errorf("the weekly review should be marked as run, got %q", s.lastReviewDay)
-	}
-}
 
-func TestReviewSkipLineWithoutAccountOmitsCash(t *testing.T) {
-	s, _ := newTestScheduler(baseConfig())
-	s.acct = nil
-	logs := captureSchedLog(t)
-	s.logEarlySkip("market closed") // no account source configured
-	if !strings.Contains(logs.String(), "[Review] not run: market closed") || strings.Contains(logs.String(), "cash") {
-		t.Errorf("log = %q", logs.String())
-	}
-	// With an account the cash and band are shown.
-	s, _ = newTestScheduler(baseConfig())
+	// Positions that cannot be read: the allocation is left out rather than guessed.
+	s.pos = fakePositions{err: errTest}
 	logs = captureSchedLog(t)
-	s.logEarlySkip("Gemini paused (daily quota exhausted)") // newTestScheduler's account: 100% cash
-	if !strings.Contains(logs.String(), "cash 100.0% of equity, band 5-30%") {
-		t.Errorf("log = %q", logs.String())
+	s.logEarlyReview(session("2026-10-16", "12:00"), "market closed")
+	lines = reviewLines(logs.String())
+	if len(lines) != 1 || !strings.Contains(lines[0], "allocation unavailable") || !strings.Contains(lines[0], "skip=market closed") {
+		t.Errorf("lines = %v", lines)
 	}
+}
+
+// reviewLines returns the [Review] lines of a log.
+func reviewLines(log string) []string {
+	var out []string
+	for _, l := range strings.Split(strings.TrimSpace(log), "\n") {
+		if strings.Contains(l, "[Review]") {
+			out = append(out, l)
+		}
+	}
+	return out
 }

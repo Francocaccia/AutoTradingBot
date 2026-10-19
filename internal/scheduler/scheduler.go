@@ -34,22 +34,32 @@ const (
 	bondStepPct = 5.0
 	// candidateAddPct is the hypothetical purchase size shown in CANDIDATE FIT.
 	candidateAddPct = 5.0
-	// reviewBreachPts is how far outside a band a sleeve must be to trigger an
-	// extra review.
-	reviewBreachPts = 5.0
 )
 
 // orderPlacer is the part of the Alpaca client that places and cancels orders.
+//
+// The kind (broker.KindEntry, KindExit, KindRebalance) is part of the
+// client_order_id, which is derived from the date, symbol, side and kind: a
+// second order for the same thing the same day is refused with
+// broker.ErrDuplicateOrder.
 type orderPlacer interface {
-	PlaceBracketOrder(symbol string, qty int, side broker.Side, stopLoss, takeProfit float64) error
-	PlaceOTOOrder(symbol string, qty int, side broker.Side, stopLoss float64) error
-	PlaceMarketOrder(symbol string, qty int, side broker.Side) error
+	PlaceBracketOrder(symbol string, qty int, side broker.Side, stopLoss, takeProfit float64, kind string) error
+	PlaceOTOOrder(symbol string, qty int, side broker.Side, stopLoss float64, kind string) error
+	PlaceMarketOrder(symbol string, qty int, side broker.Side, kind string) error
 	CancelOpenOrders(symbol string) (int, error)
+	// CheckOrder returns broker.ErrDuplicateOrder (or a lookup error) when an
+	// order of this symbol, side and kind could not be placed now. It sends nothing.
+	CheckOrder(symbol string, side broker.Side, kind string) error
 }
 
 // accountSource fetches the live account.
 type accountSource interface {
 	GetAccount() (*portfolio.Account, error)
+}
+
+// positionSource lists the open positions.
+type positionSource interface {
+	GetAllPositions() ([]portfolio.Position, error)
 }
 
 type Config struct {
@@ -85,6 +95,31 @@ type Config struct {
 	// cooldown and turnover guards. Without it BUYs are blocked.
 	History trades.Source
 
+	// EntryBlackoutOpen and EntryBlackoutClose are the no-new-BUY windows after
+	// the open and before the close (ENTRY_BLACKOUT_OPEN_MIN / _CLOSE_MIN).
+	EntryBlackoutOpen, EntryBlackoutClose time.Duration
+	// MinStopATRMult is the least ATR multiple of a stock stop (MIN_STOP_ATR_MULT);
+	// the stop is never closer than risk.StopATRMultiple ATRs either.
+	MinStopATRMult float64
+	// MinPolicyStopPct is the least distance, % of price, of the stop on a policy
+	// rebalancing buy (MIN_POLICY_STOP_PCT). 0 means defaultMinPolicyStopPct; a
+	// negative value means no stop at all.
+	MinPolicyStopPct float64
+
+	// IPSBandsMode says what happens when a sleeve is below its band minimum:
+	// "gradual" (default) buys core ETFs in tranches, "advisory" only logs the
+	// trade it would make, "off" does nothing. Bands always cap purchases.
+	IPSBandsMode string
+	// RebalanceTranchePct is the most one rebalancing trade buys, % of equity
+	// (<= 0 means defaultRebalanceTranchePct).
+	RebalanceTranchePct float64
+	// RebalanceMaxTradesPerWeek caps rebalancing trades per rolling 5 trading
+	// days (<= 0 means defaultRebalanceMaxWeek); at most one a day regardless.
+	RebalanceMaxTradesPerWeek int
+	// RebalanceBondETFs is the preference order of bond ETFs for the bond sleeve
+	// (nil means defaultRebalanceBondETFs). Only enabled, tradable ones are used.
+	RebalanceBondETFs []string
+
 	// Policy is the investment policy statement (zero value = DefaultPolicy).
 	Policy portfolio.Policy
 	// Bonds is the set of bond ETFs the bot may buy (nil = the whole curated
@@ -114,6 +149,7 @@ type Scheduler struct {
 
 	orders orderPlacer
 	acct   accountSource
+	pos    positionSource
 	// lastDecisions is the model's previous answer per symbol, shown back to it
 	// so it can see when it is about to reverse itself. Best effort: in memory.
 	lastDecisions map[string]gemini.LastDecision
@@ -121,8 +157,7 @@ type Scheduler struct {
 	policy   portfolio.Policy // IPS; its targets move with the weekly review
 	lastPeak float64          // equity high-water mark seen by checkBuyBlock
 
-	lastReviewDay     string // session date of the last weekly review call
-	lastBandReviewDay string // session date of the last band-breach review call
+	lastReviewDay string // session date of the last weekly review call
 
 	// geminiPaused overrides cfg.Gemini.Paused (tests).
 	geminiPaused func() (bool, string)
@@ -132,6 +167,21 @@ type Scheduler struct {
 
 	// fetchBond loads indicators for a bond ETF proposed by the review.
 	fetchBond func(symbol string) (*indicators.Result, error)
+	// fetchRaw loads indicators without the universe filters (indicators.Calculate);
+	// the rebalancing path falls back to it for a core ETF whose validation failed
+	// because of a data outage.
+	fetchRaw func(symbol string) (*indicators.Result, error)
+
+	// Wall-clock scheduling (see tick): the cycle runs once per time slot of the
+	// America/New_York trading day, however long the process slept in between.
+	now       func() time.Time
+	runCycle  func() // one decision cycle (runMarketCycle; replaced in tests)
+	lastSlot  string // key of the last slot a cycle ran in
+	lastCycle time.Time
+	skipDay   string    // ET date on which the market is closed for good: no more slots are tried
+	newsAt    time.Time // when the news cache was last refreshed
+	fetchNews func()    // reloads s.newsCache (fetchAndCacheNews; replaced in tests)
+	slotsRun  int
 }
 
 func New(cfg Config) *Scheduler {
@@ -149,7 +199,9 @@ func New(cfg Config) *Scheduler {
 		cfg.Macro = indicators.GetMacro
 	}
 	s := &Scheduler{cfg: cfg, ctx: ctx, cancel: cancel, sectors: map[string]string{}, gate: newEvalGate(cfg.EvalCooldown),
-		lastDecisions: map[string]gemini.LastDecision{}, policy: cfg.Policy}
+		lastDecisions: map[string]gemini.LastDecision{}, policy: cfg.Policy, now: time.Now, fetchRaw: indicators.Calculate}
+	s.runCycle = s.runMarketCycle
+	s.fetchNews = s.fetchAndCacheNews
 	if cfg.Gemini != nil {
 		s.llm = cfg.Gemini
 	}
@@ -158,6 +210,7 @@ func New(cfg Config) *Scheduler {
 	}
 	if cfg.Portfolio != nil {
 		s.acct = cfg.Portfolio
+		s.pos = cfg.Portfolio
 	}
 	if cfg.Universe != nil {
 		s.fetchBond = cfg.Universe.Validate
@@ -169,23 +222,28 @@ func (s *Scheduler) Pause()         { s.paused = true }
 func (s *Scheduler) Resume()        { s.paused = false }
 func (s *Scheduler) IsPaused() bool { return s.paused }
 
+// pollEvery is how often the loop looks at the wall clock. It is cheap (no
+// network call) and bounds how late a cycle can start after its slot begins.
+const pollEvery = 20 * time.Second
+
+// newsMaxAge is how old the news cache may get before a cycle refreshes it.
+const newsMaxAge = 4 * time.Hour
+
+// Start runs the scheduler until Stop. Cycles are tied to the America/New_York
+// wall clock, not to time since boot: see tick.
 func (s *Scheduler) Start() {
-	log.Printf("Scheduler started (cycle every %s, eval cooldown %s); first decision cycle at the next tick", s.cfg.CycleInterval, s.cfg.EvalCooldown)
-	s.logDecisionBreakdown(time.Now())
-	// No decision cycle at process start: redeploys would burn Gemini quota.
-	s.fetchAndCacheNews()
-	newsTicker := time.NewTicker(4 * time.Hour)
-	marketTicker := time.NewTicker(s.cfg.CycleInterval)
+	log.Printf("Scheduler started (a cycle in each %s slot of the ET trading day, eval cooldown %s, IPS_BANDS_MODE=%s)", s.cfg.CycleInterval, s.cfg.EvalCooldown, s.bandsMode())
+	s.logDecisionBreakdown(s.clock())
+	s.refreshNews()
+	ticker := time.NewTicker(pollEvery)
+	defer ticker.Stop()
+	s.tick(s.clock()) // a process that starts (or wakes) inside a slot runs its cycle now
 	for {
 		select {
 		case <-s.ctx.Done():
-			newsTicker.Stop()
-			marketTicker.Stop()
 			return
-		case <-newsTicker.C:
-			s.fetchAndCacheNews()
-		case <-marketTicker.C:
-			s.runMarketCycle()
+		case <-ticker.C:
+			s.tick(s.clock())
 		}
 	}
 }
@@ -287,6 +345,34 @@ type cycleState struct {
 	blocked     int            // decisions a guard refused to execute
 	dropReasons map[string]int // guard key -> count
 	sold        map[string]bool
+
+	due int // symbols that came out of the evaluation gate as due this cycle
+
+	// Investment-policy rebalancing (see rebalance.go).
+	rebal     rebalanceState
+	rebalDay  int // rebalancing orders filled today, plus placed this cycle
+	rebalWeek int // same over the rolling 5 trading days
+
+	// What the cycle's single [Review] line reports (see reviewline.go).
+	whyNot []string // reasons nothing (more) happened, in the order found
+	did    []string // actions taken: "rebalance", "buy", "sell"
+}
+
+// why records a reason for the [Review] line's skip field.
+func (cs *cycleState) why(reason string) {
+	if reason != "" {
+		cs.whyNot = append(cs.whyNot, reason)
+	}
+}
+
+// took records an action taken this cycle ("rebalance", "buy" or "sell").
+func (cs *cycleState) took(action string) {
+	for _, a := range cs.did {
+		if a == action {
+			return
+		}
+	}
+	cs.did = append(cs.did, action)
 }
 
 // decisionCounts tallies what the model answered this cycle.
@@ -304,9 +390,6 @@ type pendingDecision struct {
 	portfolioText string   // the PORTFOLIO block shown to the model, for macro-catalyst verification
 	corr          *analysis.Correlation
 	fromReview    bool // came from the weekly review (SELLs are exempt from MIN_HOLD_DAYS)
-	// rebalance marks a review BUY caused by a band breach: the code sets its
-	// catalyst (the model's quote is not checked) and the purchase is stepwise.
-	rebalance bool
 }
 
 // drop records a decision a guard refused to execute.
@@ -337,50 +420,44 @@ func (s *Scheduler) headlinesFor(symbol string) []string {
 func (s *Scheduler) runMarketCycle() {
 	if s.paused {
 		log.Println("[Scheduler] Paused — skipping cycle")
-		s.logEarlySkip("scheduler paused")
+		s.logEarlyReview(nil, "scheduler paused")
 		return
 	}
 	sess, err := market.GetSession(s.cfg.Broker)
 	if err != nil {
 		log.Printf("[Market] Session check failed: %v — skipping cycle", err)
-		s.logEarlySkip("market session unknown")
+		s.logEarlyReview(nil, "market session unknown")
 		return
+	}
+	// A holiday, or the hours after an early close, will not get a cycle today:
+	// stop asking Alpaca for the rest of the day.
+	if !sess.TradingDay || (!sess.Close.IsZero() && !sess.Now.Before(sess.Close)) {
+		s.skipDay = sess.Date
 	}
 	if !sess.IsOpen {
 		log.Println("[Market] Closed — skipping cycle")
-		s.logEarlySkip("market closed")
+		s.logEarlyReview(sess, "market closed")
 		return
 	}
 	log.Println("[Market] Open — running decision cycle")
 
-	// With Gemini paused (daily quota or local budget) no decisions are made.
-	// Stops and take-profits live in server-side bracket orders, so they keep working.
-	if paused, why := s.cfg.Gemini.Paused(); paused {
-		label := "quota"
-		switch {
-		case strings.Contains(why, "budget"):
-			label = "budget"
-		case strings.Contains(why, "no usable"):
-			label = "models"
-		}
-		log.Printf("[Gemini] %s: paused (%s; calls today %s, counted by this process) — no decisions this cycle; bracket orders stay active", label, why, s.cfg.Gemini.UsageSummary())
-		s.logEarlySkip("Gemini paused (" + why + ")")
-		return
-	}
-
 	usageBefore := map[string]int{}
-	for _, u := range s.cfg.Gemini.UsageByModel() {
-		usageBefore[u.Model] = u.Used
+	if s.cfg.Gemini != nil {
+		for _, u := range s.cfg.Gemini.UsageByModel() {
+			usageBefore[u.Model] = u.Used
+		}
 	}
 
 	acct, err := s.cfg.Portfolio.GetAccount()
 	if err != nil {
 		log.Printf("[Account] fetch failed: %v — skipping cycle", err)
+		s.logEarlyReview(sess, "account unavailable")
 		return
 	}
 	posList, err := s.cfg.Portfolio.GetAllPositions()
 	if err != nil {
 		log.Printf("[Positions] fetch failed: %v — skipping cycle", err)
+		s.logEarlyReview(sess, "positions unavailable")
 		return
 	}
 	cs := &cycleState{
@@ -414,6 +491,51 @@ func (s *Scheduler) runMarketCycle() {
 		log.Printf("[Trades] no order history source configured — BUYs blocked this cycle")
 	}
 
+	// Portfolio-level context (weights, risk, regime) once per cycle.
+	s.buildPortfolio(cs)
+
+	// With Gemini paused (daily quota or local budget) there are no model
+	// decisions, but the cycle still runs: the investment-policy rebalancing and
+	// the bookkeeping do not need the model, and stops and take-profits live in
+	// server-side bracket orders that keep working.
+	if paused, why := s.geminiPausedNow(); paused {
+		label := "quota"
+		switch {
+		case strings.Contains(why, "budget"):
+			label = "budget"
+		case strings.Contains(why, "no usable"), strings.Contains(why, "not configured"):
+			label = "models"
+		}
+		log.Printf("[Gemini] %s: paused (%s) — no model decisions this cycle; bracket orders stay active", label, why)
+		cs.stopGemini = true
+		cs.why("Gemini paused (" + why + "): no model decisions")
+	}
+	if !cs.stopGemini {
+		s.evaluateSymbols(cs)
+	}
+	s.maybeReview(cs, sess)
+	s.planRebalance(cs, sess)
+
+	s.executeDecisions(cs)
+	s.logCycleSummary(cs)
+	s.logReviewLine(cs, sess)
+}
+
+// geminiPausedNow reports whether model calls must be skipped this cycle, and why.
+func (s *Scheduler) geminiPausedNow() (bool, string) {
+	switch {
+	case s.geminiPaused != nil:
+		return s.geminiPaused()
+	case s.cfg.Gemini != nil:
+		return s.cfg.Gemini.Paused()
+	}
+	return true, "Gemini not configured"
+}
+
+// evaluateSymbols collects every symbol due for a model decision (held
+// positions first, then the core list, then screener candidates) and asks
+// Gemini about them in one batch call.
+func (s *Scheduler) evaluateSymbols(cs *cycleState) {
 	// The bot manages every open position, whether or not it is in the core
 	// list or the candidate pool. Held symbols go first so they win when the
 	// Gemini budget is tight.
@@ -436,14 +558,11 @@ func (s *Scheduler) runMarketCycle() {
 		s.noteSector(items[i].Symbol, items[i].Ind)
 	}
 
-	// Portfolio-level context (weights, risk, regime) once per cycle.
-	s.buildPortfolio(cs)
-
 	// Every symbol due for evaluation joins ONE Gemini batch call: held
 	// positions first, then core symbols, then screener candidates (see
-	// selectBatch for the cap). The weekly / band-breach review stays a separate
-	// call: its answer has a different shape and its own rules, and mixing the
-	// two made the prompt unreliable.
+	// selectBatch for the cap). The weekly review stays a separate call: its
+	// answer has a different shape and its own rules, and mixing the two made
+	// the prompt unreliable.
 	var due []*batchEntry
 	for _, sym := range held {
 		if it := inUniverse[sym]; it != nil {
@@ -454,7 +573,7 @@ func (s *Scheduler) runMarketCycle() {
 		}
 		// Outside the universe or failing the BUY filters (e.g. a low-volume
 		// ETF or a bond ETF): still managed, SELL-only. The filters gate new
-		// positions only; bond ETF purchases come from the weekly review.
+		// positions only; bond ETF purchases come from the rebalancing step.
 		ind, err := indicators.Calculate(sym)
 		if err != nil {
 			log.Printf("[%s] WARNING: indicators unavailable for held position: %v — existing bracket orders left untouched", sym, err)
@@ -486,11 +605,34 @@ func (s *Scheduler) runMarketCycle() {
 			due = append(due, e)
 		}
 	}
+	cs.due = len(due)
 	s.runBatch(cs, due)
-	s.maybeReview(cs, sess)
+}
 
-	s.executeDecisions(cs)
-	s.logCycleSummary(cs)
+// geminiLine is the per-cycle Gemini report: the model new calls go to, the
+// calls this cycle made per model, and an estimate of what is left. The
+// estimate is an upper bound while the day's earlier usage is unknown.
+func (s *Scheduler) geminiLine(cs *cycleState) string {
+	if s.cfg.Gemini == nil {
+		return "Gemini: not configured"
+	}
+	var used []string
+	for _, u := range s.cfg.Gemini.UsageByModel() {
+		if n := u.Used - cs.usageBefore[u.Model]; n > 0 {
+			used = append(used, fmt.Sprintf("%s x%d", u.Model, n))
+		}
+	}
+	active := s.cfg.Gemini.ActiveModel()
+	if active == "" {
+		active = "none usable"
+	}
+	rem, exact := s.cfg.Gemini.RemainingEstimate()
+	remaining := fmt.Sprintf("%d", rem)
+	if !exact {
+		remaining = fmt.Sprintf("at most %d (usage before the last restart is unknown; the 429 response is the real limit)", rem)
+	}
+	return fmt.Sprintf("Gemini: active model %s | used this cycle: %s | remaining budget estimate: %s | counts today: %s",
+		active, orNone(used), remaining, s.cfg.Gemini.UsageSummary())
 }
 
 // logCycleSummary prints the one-line cycle summary. buys/sells/holds are the
@@ -515,17 +657,11 @@ func (s *Scheduler) logCycleSummary(cs *cycleState) {
 		}
 		dropped += ")"
 	}
-	var used []string
-	for _, u := range s.cfg.Gemini.UsageByModel() {
-		if n := u.Used - cs.usageBefore[u.Model]; n > 0 {
-			used = append(used, fmt.Sprintf("%s x%d", u.Model, n))
-		}
-	}
-	log.Printf("[Cycle] batch=%d %v deferred=%d | evaluated=%d holds=%d buys=%d sells=%d missing=%d dropped=%s not-evaluated=%d | trades today %d/%s, week %d/%s | Gemini models used: %s; calls today: %s (in-memory count)",
+	log.Printf("[Cycle] batch=%d %v deferred=%d | evaluated=%d holds=%d buys=%d sells=%d missing=%d dropped=%s not-evaluated=%d | trades today %d/%s, week %d/%s",
 		len(cs.batchSyms), cs.batchSyms, cs.deferred,
 		cs.evaluated, cs.counts.hold, cs.counts.buy, cs.counts.sell, cs.missing, dropped, skipped,
-		cs.tradesDay, capLabel(s.cfg.MaxTradesPerDay), cs.tradesWeek, capLabel(s.cfg.MaxTradesPerWeek),
-		orNone(used), s.cfg.Gemini.UsageSummary())
+		cs.tradesDay, capLabel(s.cfg.MaxTradesPerDay), cs.tradesWeek, capLabel(s.cfg.MaxTradesPerWeek))
+	log.Print("[Cycle] " + s.geminiLine(cs))
 }
 
 // noHeadlineCandidate reports whether it is a screener candidate (not core)
@@ -565,8 +701,8 @@ func (s *Scheduler) checkBuyBlock(sess *market.Session, acct *portfolio.Account)
 	if !sess.TradingDay {
 		return "trading calendar unavailable for today", false
 	}
-	if !market.EntryWindowOpen(sess.Now, sess.Open, sess.Close, risk.EntryBuffer) {
-		return fmt.Sprintf("within %v of the open or close", risk.EntryBuffer), false
+	if !market.EntryWindowOpenAsym(sess.Now, sess.Open, sess.Close, s.cfg.EntryBlackoutOpen, s.cfg.EntryBlackoutClose) {
+		return fmt.Sprintf("within %v of the open or %v of the close", s.cfg.EntryBlackoutOpen, s.cfg.EntryBlackoutClose), false
 	}
 	return "", false
 }

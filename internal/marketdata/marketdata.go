@@ -109,3 +109,6 @@ func (c *Client) DailyBars(symbol, start string) ([]DailyBar, error) {
 	}
 	return out, nil
 }
+
+// SetBaseURL points the client at another host (tests).
+func (c *Client) SetBaseURL(u string) { c.baseURL = u }

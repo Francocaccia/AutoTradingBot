@@ -72,7 +72,7 @@ func TestRoomRejections(t *testing.T) {
 		{"unknown sector is one shared bucket", book(Holding{"A", 10_000, ""}, Holding{"B", 10_000, ""}, Holding{"C", 10_000, ""}),
 			"D", "", true, "Unknown sector limit"},
 		{"broad ETF is exempt from the sector cap", book(Holding{"A", 10_000, "Tech"}, Holding{"B", 10_000, "Tech"}, Holding{"C", 10_000, "Tech"}),
-			"SPY", "", false, "single position limit"},
+			"SPY", "", false, "single index ETF limit"},
 		{"real cash floor", Book{Equity: 100_000, Cash: 2_000, Holdings: []Holding{
 			{"A", 20_000, "Tech"}, {"B", 20_000, "Health"}, {"C", 20_000, "Energy"}, {"IEF", 15_000, ""}, {"AGG", 15_000, ""}, {"BND", 8_000, ""}}},
 			"SGOV", "", true, "real cash floor"},

@@ -22,7 +22,10 @@ type decider interface {
 	DecideBatch(prompt string, prio gemini.Priority) ([]gemini.BatchResult, error)
 	DecideAt(prompt string, prio gemini.Priority) (*gemini.Decision, error)
 	Review(prompt string) (*gemini.Review, error)
-	Remaining() int
+	// RemainingEstimate is the calls left today and whether the figure is exact:
+	// it is only an upper bound while the day's earlier usage is unknown (the
+	// process started today), and the bot never spends budget it cannot be sure of.
+	RemainingEstimate() (calls int, exact bool)
 }
 
 // batchEntry is one symbol due for evaluation this cycle.
@@ -115,7 +118,7 @@ func (s *Scheduler) buildEntry(e *batchEntry, cs *cycleState, shared string) {
 				stop = st
 			}
 		}
-	} else if l, err := risk.Bracket(ind.Price, ind.ATR, 0); err == nil {
+	} else if l, err := risk.BracketMult(ind.Price, ind.ATR, 0, s.stockStopMultiple()); err == nil {
 		stop = l.Stop
 	}
 
@@ -224,9 +227,13 @@ func (s *Scheduler) batchFailed(cs *cycleState, batch []*batchEntry, err error) 
 		log.Printf("[Batch] Gemini unavailable: %v — no decisions this cycle", err)
 		return
 	}
-	remaining := s.llm.Remaining()
+	// The estimate is an upper bound until the first call of the day has gone
+	// through; the fallback is still allowed, because a 429 or the fallback model
+	// stops an over-spend and skipping would leave held positions unreviewed.
+	remaining, _ := s.llm.RemainingEstimate()
 	if remaining <= len(batch) {
 		log.Printf("[Batch] call failed (%v); %d calls left today is not more than the %d symbols, so no per-symbol fallback — skipping this cycle", err, remaining, len(batch))
+		cs.why("Gemini batch call failed; too little budget for a per-symbol fallback")
 		return
 	}
 	log.Printf("[Batch] call failed (%v); %d calls left today for %d symbols — falling back to one call per symbol", err, remaining, len(batch))

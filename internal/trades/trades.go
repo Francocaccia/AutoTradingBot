@@ -40,6 +40,13 @@ type Fill struct {
 	ParentID      string // set on bracket / OTO child legs
 }
 
+// Kind is the kind encoded in the client_order_id (broker.KindEntry, KindExit
+// or KindRebalance), "" for legacy ids and orders that are not the bot's.
+func (f Fill) Kind() string {
+	k, _ := broker.ParseClientOrderID(f.ClientOrderID)
+	return k
+}
+
 // IsDecision reports whether the fill came from one of the bot's own
 // decisions rather than a bracket leg, a stop/limit fill or a manual order.
 //
@@ -243,6 +250,25 @@ func (s *Snapshot) DecisionCounts() (today, week int) {
 			today++
 		}
 		if w {
+			week++
+		}
+	}
+	return today, week
+}
+
+// RebalanceCounts returns how many of the bot's policy rebalancing orders (kind
+// "rebalance", see broker.KindRebalance) filled today and within the last
+// WeekWindow trading days. They are also decisions, so DecisionCounts includes them.
+func (s *Snapshot) RebalanceCounts() (today, week int) {
+	for _, f := range s.fills {
+		if f.ParentID != "" || f.Kind() != broker.KindRebalance {
+			continue
+		}
+		d := Date(f.At)
+		if d == s.today {
+			today++
+		}
+		if d >= s.weekStart() && d <= s.today {
 			week++
 		}
 	}

@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -154,12 +155,10 @@ func (s *Scheduler) buyEligibility(p *pendingDecision, cs *cycleState) (why, key
 			return fmt.Sprintf("macro regime unavailable: only SGOV, BIL and SHY may be bought (not %s)", p.symbol), "macro-unavailable"
 		}
 	}
-	// Catalyst. A rebalance BUY (caused by a band breach) carries a catalyst the
-	// code wrote itself, so nothing is checked. A bond ETF, or any review
-	// action, must quote ONE item of the PORTFOLIO block; a stock must quote a
-	// headline it was shown.
+	// Catalyst. A bond ETF, or any review action, must quote ONE item of the
+	// PORTFOLIO block; a stock must quote a headline it was shown. (Band
+	// rebalancing needs neither: planRebalance chooses it, the model does not.)
 	switch {
-	case p.rebalance:
 	case isBond || p.fromReview:
 		if !macroCatalystMatches(d.Catalyst, p.portfolioText) {
 			return fmt.Sprintf("no verified macro catalyst (%q is not one line or one \"label: value\" item of the PORTFOLIO block)", d.Catalyst), "catalyst"
@@ -184,11 +183,8 @@ func (s *Scheduler) buyEligibility(p *pendingDecision, cs *cycleState) (why, key
 		}
 	}
 
-	// Highly correlated with what is held: only as a rotation out of a held
-	// symbol. A rebalance BUY is exempt: raising a sleeve that is below its
-	// band necessarily adds exposure correlated with the holdings, and the
-	// code (not the model) chose to do it.
-	if p.corr != nil && p.corr.Avg > maxCorrelation && !p.rebalance && !s.validReplaces(p, cs) {
+	// Highly correlated with what is held: only as a rotation out of a held symbol.
+	if p.corr != nil && p.corr.Avg > maxCorrelation && !s.validReplaces(p, cs) {
 		return fmt.Sprintf("average 60d correlation to holdings %.2f exceeds %.1f and no valid \"replaces\" (%q)", p.corr.Avg, maxCorrelation, d.Replaces), "correlation"
 	}
 	return "", ""
@@ -245,6 +241,9 @@ func (s *Scheduler) executeDecisions(cs *cycleState) {
 	for _, p := range sells {
 		s.execSell(p, cs)
 	}
+	// The policy tranche goes before the discretionary BUYs: they would
+	// otherwise use up the shared daily cap first.
+	s.execRebalance(cs)
 	for _, p := range buys {
 		s.execBuy(p, cs)
 	}
@@ -284,6 +283,7 @@ func (s *Scheduler) execSell(p pendingDecision, cs *cycleState) bool {
 		cs.tradesDay++
 		cs.tradesWeek++
 	}
+	cs.took("sell")
 	return true
 }
 
@@ -329,6 +329,7 @@ func (s *Scheduler) execBuy(p pendingDecision, cs *cycleState) {
 	if placed {
 		cs.tradesDay++
 		cs.tradesWeek++
+		cs.took("buy")
 	}
 }
 
@@ -337,7 +338,7 @@ func (s *Scheduler) execBuy(p pendingDecision, cs *cycleState) {
 func (s *Scheduler) placeBuy(p pendingDecision, cs *cycleState) bool {
 	symbol, ind, decision := p.symbol, p.ind, p.decision
 	position := cs.positions[symbol]
-	levels, err := risk.Bracket(ind.Price, ind.ATR, decision.TakeProfit)
+	levels, err := risk.BracketMult(ind.Price, ind.ATR, decision.TakeProfit, s.stockStopMultiple())
 	if err != nil {
 		cs.drop(symbol, "BUY", "bracket", fmt.Sprintf("rejected: %v", err))
 		return false
@@ -409,16 +410,24 @@ func (s *Scheduler) placeBuy(p pendingDecision, cs *cycleState) bool {
 		qty = capped
 	}
 
-	if err := s.orders.PlaceBracketOrder(symbol, qty, broker.Buy, levels.Stop, levels.Take); err != nil {
-		log.Printf("[%s] BUY (bracket) failed: %v", symbol, err)
-		return false
+	if err := s.orders.PlaceBracketOrder(symbol, qty, broker.Buy, levels.Stop, levels.Take, broker.KindEntry); err != nil {
+		return s.orderFailed(cs, symbol, "BUY", "BUY (bracket)", err)
 	}
 	log.Printf("[%s] BUY %d shares @ ~$%.2f (bracket stop=%.2f take=%.2f R:R=%.1f)", symbol, qty, ind.Price, levels.Stop, levels.Take, levels.RewardRisk)
 	s.recordBuy(cs, symbol, position, qty, ind.Price)
-	if p.rebalance {
-		s.logRebalance(cs, acct, float64(qty)*ind.Price)
-	}
 	return true
+}
+
+// orderFailed handles an order the broker layer did not place. A duplicate (the
+// same order already went in today, e.g. before a restart) is a skipped
+// decision, not an error; anything else is logged. It always returns false.
+func (s *Scheduler) orderFailed(cs *cycleState, symbol, action, what string, err error) bool {
+	if errors.Is(err, broker.ErrDuplicateOrder) {
+		cs.drop(symbol, action, "duplicate", err.Error())
+		return false
+	}
+	log.Printf("[%s] %s failed: %v", symbol, what, err)
+	return false
 }
 
 // sleeveStep is the most a single review / bond purchase of sym may add: at
@@ -437,19 +446,6 @@ func (s *Scheduler) sleeveStep(sym string, book portfolio.Book, equity float64) 
 		value = math.Min(value, gap)
 	}
 	return value, "", ""
-}
-
-// logRebalance reports how far the book still is from its bands after a
-// rebalance BUY that spent `spent` dollars of cash (acct is the pre-order account).
-func (s *Scheduler) logRebalance(cs *cycleState, acct *portfolio.Account, spent float64) {
-	after := *acct
-	after.Cash -= spent
-	if pts, desc := s.policy.BandBreach(s.bookFrom(cs, &after)); pts > 0 {
-		log.Printf("[Rebalance] rebalance in progress, %.1f points remaining (%s); at most %.0f%% of equity per trade and %s trades a day",
-			pts, desc, bondStepPct, capLabel(s.cfg.MaxTradesPerDay))
-	} else {
-		log.Printf("[Rebalance] complete: every sleeve is back inside its band")
-	}
 }
 
 // recordBuy reflects a placed BUY in the cycle's position map so later orders
@@ -501,15 +497,11 @@ func (s *Scheduler) placeBondBuy(p pendingDecision, cs *cycleState) bool {
 	}
 
 	if info.CashLike {
-		if err := s.orders.PlaceMarketOrder(sym, qty, broker.Buy); err != nil {
-			log.Printf("[%s] BUY failed: %v", sym, err)
-			return false
+		if err := s.orders.PlaceMarketOrder(sym, qty, broker.Buy, broker.KindEntry); err != nil {
+			return s.orderFailed(cs, sym, "BUY", "BUY", err)
 		}
 		log.Printf("[%s] BUY %d shares @ ~$%.2f (cash-like ETF, no bracket, %.1f%% of equity)", sym, qty, ind.Price, float64(qty)*ind.Price/acct.Equity*100)
 		s.recordBuy(cs, sym, cs.positions[sym], qty, ind.Price)
-		if p.rebalance {
-			s.logRebalance(cs, acct, float64(qty)*ind.Price)
-		}
 		return true
 	}
 
@@ -527,28 +519,28 @@ func (s *Scheduler) placeBondBuy(p pendingDecision, cs *cycleState) bool {
 			sym, qty, capped, float64(capped)*(ind.Price-stop), acct.Equity*s.cfg.MaxRiskPct/100, s.cfg.MaxRiskPct, stopPct)
 		qty = capped
 	}
-	if err := s.orders.PlaceOTOOrder(sym, qty, broker.Buy, stop); err != nil {
-		log.Printf("[%s] BUY (stop-only) failed: %v", sym, err)
-		return false
+	if err := s.orders.PlaceOTOOrder(sym, qty, broker.Buy, stop, broker.KindEntry); err != nil {
+		return s.orderFailed(cs, sym, "BUY", "BUY (stop-only)", err)
 	}
 	log.Printf("[%s] BUY %d shares @ ~$%.2f (bond ETF, %.0fx ATR stop=%.2f, no take-profit, %.1f%% of equity)",
 		sym, qty, ind.Price, risk.BondStopATRMultiple, stop, float64(qty)*ind.Price/acct.Equity*100)
 	s.recordBuy(cs, sym, cs.positions[sym], qty, ind.Price)
-	if p.rebalance {
-		s.logRebalance(cs, acct, float64(qty)*ind.Price)
-	}
 	return true
 }
 
 // closePosition exits a whole long position. Open bracket legs reserve the
 // shares, so they are cancelled first. It reports whether the order was placed.
 func (s *Scheduler) closePosition(symbol string, pos *portfolio.Position, cs *cycleState) bool {
+	// Ask first: cancelling a position's stop legs and only then finding that the
+	// exit is a duplicate (or that the lookup fails) would leave it unprotected.
+	if err := s.orders.CheckOrder(symbol, broker.Sell, broker.KindExit); err != nil {
+		return s.orderFailed(cs, symbol, "SELL", "SELL", err)
+	}
 	if n, err := s.orders.CancelOpenOrders(symbol); err != nil {
 		log.Printf("[%s] cancelling open orders failed (%d cancelled): %v", symbol, n, err)
 	}
-	if err := s.orders.PlaceMarketOrder(symbol, pos.Qty, broker.Sell); err != nil {
-		log.Printf("[%s] SELL failed: %v", symbol, err)
-		return false
+	if err := s.orders.PlaceMarketOrder(symbol, pos.Qty, broker.Sell, broker.KindExit); err != nil {
+		return s.orderFailed(cs, symbol, "SELL", "SELL", err)
 	}
 	log.Printf("[%s] SELL %d shares (closing long)", symbol, pos.Qty)
 	delete(cs.positions, symbol)

@@ -2,8 +2,6 @@ package broker
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // validSymbol guards URL path/query construction against odd characters
@@ -33,13 +34,14 @@ type AlpacaClient struct {
 	apiSecret string
 	baseURL   string
 	http      *http.Client
+	now       func() time.Time // overridden in tests
 }
 
 func NewAlpacaClient(apiKey, apiSecret, baseURL string) *AlpacaClient {
 	if baseURL == "" {
 		baseURL = "https://paper-api.alpaca.markets"
 	}
-	return &AlpacaClient{apiKey: apiKey, apiSecret: apiSecret, baseURL: baseURL, http: &http.Client{}}
+	return &AlpacaClient{apiKey: apiKey, apiSecret: apiSecret, baseURL: baseURL, http: &http.Client{Timeout: 30 * time.Second}, now: time.Now}
 }
 
 func (c *AlpacaClient) doRequest(method, path string, body any) ([]byte, int, error) {
@@ -74,13 +76,124 @@ func (c *AlpacaClient) doRequest(method, path string, body any) ([]byte, int, er
 // client_order_id Alpaca generates) and manual orders never count.
 const ClientOrderPrefix = "atb-"
 
-// NewClientOrderID returns a fresh client_order_id with ClientOrderPrefix.
-func NewClientOrderID() string {
-	var b [12]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return ClientOrderPrefix + "fallback"
+// Order kinds, the last part of a client_order_id.
+const (
+	KindEntry     = "entry"     // a decision to open or add to a position
+	KindExit      = "exit"      // a decision to close a position
+	KindRebalance = "rebalance" // an investment-policy tranche toward a sleeve's minimum band
+)
+
+// ErrDuplicateOrder means the bot already submitted an order for the same
+// symbol and side on this ET date (or has failed to place one too many times),
+// so nothing was sent. It makes a restart or a repeated cycle harmless.
+var ErrDuplicateOrder = errors.New("order already submitted today")
+
+// maxOrderAttempts is how many orders per symbol, side and day may be tried
+// when earlier ones were canceled, expired or rejected.
+const maxOrderAttempts = 3
+
+var etLoc = func() *time.Location {
+	if loc, err := time.LoadLocation("America/New_York"); err == nil {
+		return loc
 	}
-	return ClientOrderPrefix + hex.EncodeToString(b[:])
+	return time.FixedZone("ET", -5*3600)
+}()
+
+// orderDate is the ET calendar date of t as YYYYMMDD.
+func orderDate(t time.Time) string { return t.In(etLoc).Format("20060102") }
+
+// ClientOrderID derives the id of an order from what it is: the ET date, the
+// symbol, the side and the kind, e.g. "atb-20261016-NVDA-buy-entry". The same
+// decision therefore always has the same id, which the broker rejects as a
+// duplicate. attempt > 1 appends "-rN" for a retry after a failed order.
+func ClientOrderID(date, symbol string, side Side, kind string, attempt int) string {
+	id := fmt.Sprintf("%s%s-%s-%s-%s", ClientOrderPrefix, date, symbol, side, kind)
+	if attempt > 1 {
+		id += fmt.Sprintf("-r%d", attempt)
+	}
+	return id
+}
+
+// ParseClientOrderID returns the kind encoded in a client_order_id built by
+// ClientOrderID. ok is false for legacy random ids and for orders that are not
+// the bot's.
+func ParseClientOrderID(id string) (kind string, ok bool) {
+	parts := strings.Split(id, "-")
+	if len(parts) < 5 || parts[0]+"-" != ClientOrderPrefix || len(parts[1]) != 8 {
+		return "", false
+	}
+	switch parts[4] {
+	case KindEntry, KindExit, KindRebalance:
+		return parts[4], true
+	}
+	return "", false
+}
+
+// orderInfo is the part of a listed order the duplicate check reads.
+type orderInfo struct {
+	ClientOrderID string `json:"client_order_id"`
+	Side          string `json:"side"`
+	Status        string `json:"status"`
+	FilledQty     string `json:"filled_qty"`
+}
+
+// dead reports whether the order can no longer fill: it was canceled, expired
+// or rejected without filling anything.
+func (o orderInfo) dead() bool {
+	if q, _ := strconv.ParseFloat(o.FilledQty, 64); q > 0 {
+		return false
+	}
+	switch o.Status {
+	case "canceled", "expired", "rejected", "replaced", "done_for_day", "suspended":
+		return true
+	}
+	return false
+}
+
+// nextOrderID returns the client_order_id for a new order, after looking at
+// today's orders for the symbol: if one for the same side is live or filled it
+// returns ErrDuplicateOrder. The lookup failing is an error too: not knowing
+// whether an order exists is a reason not to send another.
+func (c *AlpacaClient) nextOrderID(symbol string, side Side, kind string) (string, error) {
+	if !validSymbol.MatchString(symbol) {
+		return "", fmt.Errorf("invalid symbol %q", symbol)
+	}
+	now := c.now().In(etLoc)
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, etLoc)
+	q := url.Values{"status": {"all"}, "symbols": {symbol}, "direction": {"asc"}, "limit": {"100"},
+		"after": {midnight.UTC().Format(time.RFC3339)}}
+	data, _, err := c.doRequest("GET", "/v2/orders?"+q.Encode(), nil)
+	if err != nil {
+		return "", fmt.Errorf("checking today's orders for %s: %w", symbol, err)
+	}
+	var orders []orderInfo
+	if err := json.Unmarshal(data, &orders); err != nil {
+		return "", fmt.Errorf("checking today's orders for %s: %w", symbol, err)
+	}
+	prefix := fmt.Sprintf("%s%s-%s-%s-", ClientOrderPrefix, orderDate(now), symbol, side)
+	failed := 0
+	for _, o := range orders {
+		if !strings.HasPrefix(o.ClientOrderID, prefix) || o.Side != string(side) {
+			continue
+		}
+		if !o.dead() {
+			return "", fmt.Errorf("%w: %s %s (%s, %s)", ErrDuplicateOrder, side, symbol, o.ClientOrderID, o.Status)
+		}
+		failed++
+	}
+	if failed >= maxOrderAttempts {
+		return "", fmt.Errorf("%w: %d earlier %s %s orders today failed", ErrDuplicateOrder, failed, side, symbol)
+	}
+	return ClientOrderID(orderDate(now), symbol, side, kind, failed+1), nil
+}
+
+// CheckOrder reports whether an order of this symbol and side could be placed
+// now without duplicating one from today (nil), or why not (ErrDuplicateOrder,
+// or the lookup error). It sends nothing, so a caller can ask before it does
+// anything irreversible such as cancelling a position's stop orders.
+func (c *AlpacaClient) CheckOrder(symbol string, side Side, kind string) error {
+	_, err := c.nextOrderID(symbol, side, kind)
+	return err
 }
 
 type orderRequest struct {
@@ -92,9 +205,15 @@ type orderRequest struct {
 	ClientOrderID string `json:"client_order_id"`
 }
 
-func (c *AlpacaClient) PlaceMarketOrder(symbol string, qty int, side Side) error {
-	body := orderRequest{Symbol: symbol, Qty: qty, Side: side, Type: "market", TimeInForce: "day", ClientOrderID: NewClientOrderID()}
-	_, _, err := c.doRequest("POST", "/v2/orders", body)
+// PlaceMarketOrder submits a plain market order of the given kind (KindEntry,
+// KindExit or KindRebalance). See nextOrderID for the duplicate protection.
+func (c *AlpacaClient) PlaceMarketOrder(symbol string, qty int, side Side, kind string) error {
+	id, err := c.nextOrderID(symbol, side, kind)
+	if err != nil {
+		return err
+	}
+	body := orderRequest{Symbol: symbol, Qty: qty, Side: side, Type: "market", TimeInForce: "day", ClientOrderID: id}
+	_, _, err = c.doRequest("POST", "/v2/orders", body)
 	return err
 }
 
@@ -122,7 +241,11 @@ const bracketTimeInForce = "gtc"
 
 // PlaceBracketOrder submits a market entry order with attached take-profit
 // and stop-loss legs (order_class: bracket).
-func (c *AlpacaClient) PlaceBracketOrder(symbol string, qty int, side Side, stopLoss, takeProfit float64) error {
+func (c *AlpacaClient) PlaceBracketOrder(symbol string, qty int, side Side, stopLoss, takeProfit float64, kind string) error {
+	id, err := c.nextOrderID(symbol, side, kind)
+	if err != nil {
+		return err
+	}
 	body := bracketOrderRequest{
 		Symbol:        symbol,
 		Qty:           qty,
@@ -130,11 +253,11 @@ func (c *AlpacaClient) PlaceBracketOrder(symbol string, qty int, side Side, stop
 		Type:          "market",
 		TimeInForce:   bracketTimeInForce,
 		OrderClass:    "bracket",
-		ClientOrderID: NewClientOrderID(),
+		ClientOrderID: id,
 		TakeProfit:    bracketLeg{LimitPrice: fmt.Sprintf("%.2f", takeProfit)},
 		StopLoss:      bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
 	}
-	_, _, err := c.doRequest("POST", "/v2/orders", body)
+	_, _, err = c.doRequest("POST", "/v2/orders", body)
 	return err
 }
 
@@ -150,14 +273,18 @@ type otoOrderRequest struct {
 }
 
 // PlaceOTOOrder submits a market entry with an attached stop-loss leg only
-// (order_class: oto). Used for bond ETFs, which are reviewed on a schedule
-// instead of carrying a take-profit.
-func (c *AlpacaClient) PlaceOTOOrder(symbol string, qty int, side Side, stopLoss float64) error {
+// (order_class: oto). Used for bond ETFs and policy rebalancing trades, which
+// are reviewed on a schedule instead of carrying a take-profit.
+func (c *AlpacaClient) PlaceOTOOrder(symbol string, qty int, side Side, stopLoss float64, kind string) error {
+	id, err := c.nextOrderID(symbol, side, kind)
+	if err != nil {
+		return err
+	}
 	body := otoOrderRequest{
 		Symbol: symbol, Qty: qty, Side: side, Type: "market", TimeInForce: bracketTimeInForce,
-		OrderClass: "oto", ClientOrderID: NewClientOrderID(), StopLoss: bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
+		OrderClass: "oto", ClientOrderID: id, StopLoss: bracketLeg{StopPrice: fmt.Sprintf("%.2f", stopLoss)},
 	}
-	_, _, err := c.doRequest("POST", "/v2/orders", body)
+	_, _, err = c.doRequest("POST", "/v2/orders", body)
 	return err
 }
 
@@ -208,6 +335,15 @@ func (c *AlpacaClient) GetAsset(symbol string) ([]byte, error) {
 // GetPortfolioHistory returns the daily equity curve for period (e.g. "30D").
 func (c *AlpacaClient) GetPortfolioHistory(period string) ([]byte, error) {
 	data, _, err := c.doRequest("GET", "/v2/account/portfolio/history?timeframe=1D&period="+period, nil)
+	return data, err
+}
+
+// GetPortfolioHistoryRange returns the equity curve between two dates
+// (YYYY-MM-DD) at the given timeframe ("1Min" is accepted for ranges of at most
+// seven days, "5Min" up to thirty, "1D" for anything longer).
+func (c *AlpacaClient) GetPortfolioHistoryRange(timeframe, start, end string) ([]byte, error) {
+	q := url.Values{"timeframe": {timeframe}, "date_start": {start}, "date_end": {end}}
+	data, _, err := c.doRequest("GET", "/v2/account/portfolio/history?"+q.Encode(), nil)
 	return data, err
 }
 
