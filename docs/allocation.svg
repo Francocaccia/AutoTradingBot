@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" width="760" height="380" role="img" aria-labelledby="t d">
-<title id="t">Allocation chart</title>
-<desc id="d">Tracking since 2026-10-13, chart appears after 10 trading days</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 338" width="760" height="338" role="img" aria-labelledby="t d">
+<title id="t">Allocation against policy bands</title>
+<desc id="d">Current sleeve allocation, in percent of portfolio value, against the policy band of each sleeve.</desc>
 <style>
   :root { --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --grid:#d8dee4; --band:#dbe9f6; --bar:#1f6feb;
           --bot:#1f6feb; --spy:#d1730a; --qqq:#8250df; --mix:#1a7f37; }
@@ -11,8 +11,36 @@
   text { font-family:system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; fill:var(--fg); }
   .muted { fill:var(--muted); }
 </style>
-<rect width="760" height="380" rx="8" fill="var(--bg)"/>
-<text x="380.0" y="184.0" text-anchor="middle" font-size="20" font-weight="600">Allocation chart</text>
-<text x="380.0" y="212.0" text-anchor="middle" font-size="15" class="muted">Tracking since 2026-10-13, chart appears after 10 trading days</text>
-<text x="380.0" y="362" text-anchor="middle" font-size="12" class="muted">Paper trading only. Not investment advice.</text>
+<rect width="760" height="338" rx="8" fill="var(--bg)"/>
+<text x="28" y="30" font-size="18" font-weight="600">Allocation against policy bands</text>
+<text x="28" y="49" font-size="12" class="muted">Share of portfolio value. Shaded range = allowed band; bar = current.</text>
+<line x1="150.0" x2="150.0" y1="74" y2="268" stroke="var(--grid)" stroke-width="0.8"/>
+<text x="150.0" y="68" text-anchor="middle" font-size="11" class="muted">0%</text>
+<line x1="292.5" x2="292.5" y1="74" y2="268" stroke="var(--grid)" stroke-width="0.8"/>
+<text x="292.5" y="68" text-anchor="middle" font-size="11" class="muted">25%</text>
+<line x1="435.0" x2="435.0" y1="74" y2="268" stroke="var(--grid)" stroke-width="0.8"/>
+<text x="435.0" y="68" text-anchor="middle" font-size="11" class="muted">50%</text>
+<line x1="577.5" x2="577.5" y1="74" y2="268" stroke="var(--grid)" stroke-width="0.8"/>
+<text x="577.5" y="68" text-anchor="middle" font-size="11" class="muted">75%</text>
+<line x1="720.0" x2="720.0" y1="74" y2="268" stroke="var(--grid)" stroke-width="0.8"/>
+<text x="720.0" y="68" text-anchor="middle" font-size="11" class="muted">100%</text>
+<text x="28" y="106" font-size="14">Equities</text>
+<rect x="378.0" y="84" width="199.5" height="34" rx="4" fill="var(--band)"/>
+<text x="384.0" y="132" font-size="11" class="muted">band 40-75%</text>
+<rect x="150.0" y="92" width="154.1" height="18" rx="3" fill="var(--bar)"/>
+<text x="312.1" y="106" font-size="13" font-weight="600">27.0%</text>
+<text x="720" y="132" text-anchor="end" font-size="11" class="muted">below minimum</text>
+<text x="28" y="172" font-size="14">Bonds</text>
+<rect x="235.5" y="150" width="142.5" height="34" rx="4" fill="var(--band)"/>
+<text x="241.5" y="198" font-size="11" class="muted">band 15-40%</text>
+<rect x="150.0" y="158" width="28.7" height="18" rx="3" fill="var(--bar)"/>
+<text x="186.7" y="172" font-size="13" font-weight="600">5.0%</text>
+<text x="720" y="198" text-anchor="end" font-size="11" class="muted">below minimum</text>
+<text x="28" y="238" font-size="14">Cash and T-bills</text>
+<rect x="178.5" y="216" width="142.5" height="34" rx="4" fill="var(--band)"/>
+<text x="184.5" y="264" font-size="11" class="muted">band 5-30%</text>
+<rect x="150.0" y="224" width="387.2" height="18" rx="3" fill="var(--bar)"/>
+<text x="545.2" y="238" font-size="13" font-weight="600">67.9%</text>
+<text x="720" y="264" text-anchor="end" font-size="11" class="muted">above maximum</text>
+<text x="28" y="312" font-size="12" class="muted">Tracking since 2026-10-13. Paper trading only. Not investment advice.</text>
 </svg>
