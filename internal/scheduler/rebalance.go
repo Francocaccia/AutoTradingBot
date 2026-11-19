@@ -23,8 +23,10 @@ const (
 )
 
 const (
-	defaultRebalanceTranchePct = 5.0
-	defaultRebalanceMaxWeek    = 2
+	// The policy floors are mandatory, so they are reached in about a week, not
+	// three: a tranche of 10% of equity, one trade a day, five a week.
+	defaultRebalanceTranchePct = 10.0
+	defaultRebalanceMaxWeek    = 5
 	// maxRebalancePerDay is fixed: one policy trade a day, whatever else is allowed.
 	maxRebalancePerDay = 1
 	// defaultMinPolicyStopPct is the least distance of a policy trade's stop
@@ -120,12 +122,19 @@ type rebalanceState struct {
 	placed bool
 }
 
-// sleeveGap is a sleeve below its band minimum.
+// Why a sleeve needs buying.
+const (
+	gapFloor       = "floor"         // below its band minimum
+	gapCashOverMax = "cash-over-max" // cash above its band maximum: the sleeves below target absorb it
+)
+
+// sleeveGap is a sleeve the policy asks to buy into.
 type sleeveGap struct {
 	sleeve  string
+	kind    string
 	weight  float64
-	min     float64
-	deficit float64 // percentage points below the minimum
+	min     float64 // the floor, or the target for a cash-over-max gap
+	deficit float64 // percentage points to buy (to the floor, or the part of the excess cash it can take)
 }
 
 // planRebalance looks for a sleeve below its band minimum and, in gradual mode,
@@ -165,13 +174,35 @@ func (s *Scheduler) planRebalance(cs *cycleState, sess *market.Session) {
 				log.Printf("[Rebalance] %s %.1f%% is above its %.0f%% maximum: not selling, and no purchases into it", sleeve, w[sleeve], hi)
 			}
 		case sleeve != portfolio.SleeveCash && lo-w[sleeve] >= minDeficitPts-1e-9:
-			gaps = append(gaps, sleeveGap{sleeve: sleeve, weight: w[sleeve], min: lo, deficit: lo - w[sleeve]})
+			gaps = append(gaps, sleeveGap{sleeve: sleeve, kind: gapFloor, weight: w[sleeve], min: lo, deficit: lo - w[sleeve]})
+		}
+	}
+	// The floors alone do not satisfy the cash band (40% + 15% leaves 45% cash
+	// against a 30% maximum), so once the floors are met, cash above its maximum
+	// is spent on the sleeve furthest under its target, until cash is back inside.
+	_, cashHi := s.policy.Band(portfolio.SleeveCash)
+	if excess := w[portfolio.SleeveCash] - cashHi; excess >= minDeficitPts-1e-9 {
+		for _, sleeve := range []string{portfolio.SleeveEquities, portfolio.SleeveBonds} {
+			_, hi := s.policy.Band(sleeve)
+			target := s.policy.Target(sleeve)
+			if gap := math.Min(target-w[sleeve], excess); w[sleeve] < hi && gap >= minDeficitPts-1e-9 {
+				gaps = append(gaps, sleeveGap{sleeve: sleeve, kind: gapCashOverMax, weight: w[sleeve], min: target, deficit: gap})
+			}
 		}
 	}
 	if len(gaps) == 0 {
 		return
 	}
-	sort.SliceStable(gaps, func(i, j int) bool { return gaps[i].deficit > gaps[j].deficit })
+	// Floors first (the biggest shortfall first), then cash-over-max absorption.
+	sort.SliceStable(gaps, func(i, j int) bool {
+		if (gaps[i].kind == gapFloor) != (gaps[j].kind == gapFloor) {
+			return gaps[i].kind == gapFloor
+		}
+		return gaps[i].deficit > gaps[j].deficit
+	})
+	if mode == bandsAdvisory {
+		log.Printf("[Rebalance] WARNING: IPS_BANDS_MODE=advisory, so the policy is NOT being enforced: %s. Set IPS_BANDS_MODE=gradual to act on it", gapText(gaps, "breach"))
+	}
 
 	var skip string
 	switch {
@@ -218,10 +249,22 @@ func (s *Scheduler) planRebalance(cs *cycleState, sess *market.Session) {
 	}
 }
 
+// describe is the reason logged with a trade for this gap.
+func (g sleeveGap) describe(tranchePct float64) string {
+	if g.kind == gapCashOverMax {
+		return fmt.Sprintf("cash is above its band maximum and the %s sleeve %.1f%% is under its %.0f%% target (tranche limit %.1f%% of equity)", g.sleeve, g.weight, g.min, tranchePct)
+	}
+	return fmt.Sprintf("%s sleeve %.1f%% is below its %.0f%% minimum (tranche limit %.1f%% of equity)", g.sleeve, g.weight, g.min, tranchePct)
+}
+
 // gapText prefixes a skip reason with the sleeves that are under their minimum.
 func gapText(gaps []sleeveGap, reason string) string {
 	var parts []string
 	for _, g := range gaps {
+		if g.kind == gapCashOverMax {
+			parts = append(parts, fmt.Sprintf("cash over its maximum, %s %.1f%% < %.0f%% target", g.sleeve, g.weight, g.min))
+			continue
+		}
 		parts = append(parts, fmt.Sprintf("%s %.1f%% < %.0f%% min", g.sleeve, g.weight, g.min))
 	}
 	return strings.Join(parts, ", ") + " → " + reason
@@ -342,7 +385,7 @@ func (s *Scheduler) proposeTranche(cs *cycleState, book portfolio.Book, g sleeve
 		size := float64(qty) * ind.Price / acct.Equity * 100
 		return &rebalancePlan{
 			sleeve: g.sleeve, symbol: sym, qty: qty, price: ind.Price, stop: stop, sizePct: size, deficit: g.deficit,
-			reason: fmt.Sprintf("%s sleeve %.1f%% is below its %.0f%% minimum (tranche limit %.1f%% of equity)", g.sleeve, g.weight, g.min, s.rebalanceTranchePct()),
+			reason: g.describe(s.rebalanceTranchePct()),
 		}, ""
 	}
 	return nil, strings.Join(notes, "; ")

@@ -210,6 +210,24 @@ func (s *Snapshot) SinceLastSell(symbol string) (days int, ok bool) {
 	return 0, false
 }
 
+// SinceLastStop returns the trading days since the most recent sell of symbol
+// that was filled by a stop order (0 = today); ok is false when there is none in
+// the window. A stop-out says the position was wrong at that price, so buying the
+// same name back a few days later only repeats it.
+func (s *Snapshot) SinceLastStop(symbol string) (days int, ok bool) {
+	for i := len(s.fills) - 1; i >= 0; i-- {
+		f := s.fills[i]
+		if f.Symbol != symbol || f.Side != "sell" {
+			continue
+		}
+		switch f.Type {
+		case "stop", "stop_limit", "trailing_stop":
+			return s.daysAfter(Date(f.At)), true
+		}
+	}
+	return 0, false
+}
+
 // WeekWindow is the number of trading days (today included) in the rolling
 // weekly turnover window.
 const WeekWindow = 5

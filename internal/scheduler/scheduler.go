@@ -106,6 +106,14 @@ type Config struct {
 	// negative value means no stop at all.
 	MinPolicyStopPct float64
 
+	// PolicyFirst (POLICY_FIRST): while the policy is not met (an equity or bond
+	// sleeve under its floor, cash over its maximum) and IPS_BANDS_MODE=gradual,
+	// the model's single-stock BUYs wait: the index-ETF core is built first.
+	PolicyFirst bool
+	// StopReentryCooldownDays (STOP_REENTRY_COOLDOWN_DAYS): no discretionary BUY of
+	// a symbol for this many trading days after it was sold by a stop; 0 disables.
+	StopReentryCooldownDays int
+
 	// IPSBandsMode says what happens when a sleeve is below its band minimum:
 	// "gradual" (default) buys core ETFs in tranches, "advisory" only logs the
 	// trade it would make, "off" does nothing. Bands always cap purchases.

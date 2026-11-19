@@ -16,6 +16,9 @@ import (
 func policyScheduler(mode string) (*Scheduler, *fakeOrders) {
 	cfg := baseConfig()
 	cfg.IPSBandsMode = mode
+	// The tests below were written for 5% tranches and two a week; the new
+	// defaults (10% and five) have their own tests in strategy_test.go.
+	cfg.RebalanceTranchePct, cfg.RebalanceMaxTradesPerWeek = 5, 2
 	s, o := reviewScheduler(cfg)
 	s.llm = nil
 	return s, o
@@ -109,7 +112,7 @@ func TestTrancheIsAtMostFivePercentAndAtMostTheDeficit(t *testing.T) {
 
 	// A sliver under a point is left alone, silently.
 	s, o = policyScheduler("gradual")
-	cs = policyCycle(s, 31_500, map[string]float64{"SPY": 55_000, "IEF": 14_500})
+	cs = policyCycle(s, 30_500, map[string]float64{"SPY": 55_000, "IEF": 14_500})
 	runPolicy(s, cs)
 	if len(o.placed) != 0 || len(cs.whyNot) != 0 {
 		t.Errorf("a 0.5 point deficit: %+v %v", o.placed, cs.whyNot)

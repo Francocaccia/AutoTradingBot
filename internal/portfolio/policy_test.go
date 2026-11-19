@@ -51,6 +51,7 @@ func TestSleeveClassification(t *testing.T) {
 
 func TestRoomRejections(t *testing.T) {
 	p := DefaultPolicy()
+	p.MaxSatellitePct = 0 // the satellite cap has its own test
 	tests := []struct {
 		name     string
 		book     Book
@@ -95,6 +96,7 @@ func TestRoomRejections(t *testing.T) {
 
 func TestRoomValues(t *testing.T) {
 	p := DefaultPolicy()
+	p.MaxSatellitePct = 0 // the satellite cap has its own test
 	// 5k of a 10k limit already held: 5k of room.
 	if room, _ := p.Room(book(Holding{"AAPL", 5_000, "Technology"}), "AAPL", "Technology"); math.Abs(room-5_000) > 1e-6 {
 		t.Errorf("room = %v, want 5000", room)
@@ -110,6 +112,7 @@ func TestRoomValues(t *testing.T) {
 
 func TestDurationCap(t *testing.T) {
 	p := DefaultPolicy()
+	p.MaxSatellitePct = 0 // the satellite cap has its own test
 	p.MaxBondETFPct = 100 // isolate the duration cap
 	p.BondMax = 100
 	// 10k SHY (1.9y) held: adding TLT (16.5y) is bounded by the 8y portfolio cap.
@@ -143,6 +146,7 @@ func TestDurationCap(t *testing.T) {
 
 func TestBandBreachAndClip(t *testing.T) {
 	p := DefaultPolicy()
+	p.MaxSatellitePct = 0 // the satellite cap has its own test
 	// 20% cash... within band; equities 35% is 5 points under the 40% minimum.
 	b := Book{Equity: 100_000, Cash: 20_000, Holdings: []Holding{{"AAPL", 10_000, "Tech"}, {"SPY", 25_000, ""}, {"IEF", 45_000, ""}}}
 	pts, desc := p.BandBreach(b)

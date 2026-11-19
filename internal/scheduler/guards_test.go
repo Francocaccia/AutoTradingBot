@@ -133,7 +133,7 @@ func newTestScheduler(cfg Config) (*Scheduler, *fakeOrders) {
 		cfg: cfg, sectors: map[string]string{}, gate: newEvalGate(0), orders: o,
 		acct:          fakeAcct{portfolio.Account{Equity: 100_000, Cash: 100_000, BuyingPower: 100_000}},
 		lastDecisions: map[string]gemini.LastDecision{},
-		policy:        portfolio.DefaultPolicy(),
+		policy:        noSatelliteCap(portfolio.DefaultPolicy()),
 	}, o
 }
 
@@ -446,4 +446,11 @@ func TestCandidateWithoutHeadlineIsSkipped(t *testing.T) {
 	if s.noHeadlineCandidate(universe.Item{Symbol: "AAPL", Core: true}) {
 		t.Error("core symbols are not subject to the candidate news requirement")
 	}
+}
+
+// noSatelliteCap switches the satellite cap off: most tests here put several
+// stocks in one book to exercise something else, and strategy_test.go covers the cap.
+func noSatelliteCap(p portfolio.Policy) portfolio.Policy {
+	p.MaxSatellitePct = 0
+	return p
 }

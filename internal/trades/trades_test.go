@@ -303,3 +303,31 @@ func TestRebalanceCountsComeFromTheClientOrderID(t *testing.T) {
 		t.Errorf("kind = %q", k)
 	}
 }
+
+func TestSinceLastStopOnlySeesStopFills(t *testing.T) {
+	sell := func(sym, typ, at string) Fill {
+		return Fill{Symbol: sym, Side: "sell", Type: typ, At: et(t, at), Qty: 5}
+	}
+	s := snap(t,
+		sell("AAA", "stop", "2026-10-09 10:00"),       // 4 trading days ago
+		sell("AAA", "market", "2026-10-14 10:00"),     // a later discretionary sale does not reset it
+		sell("BBB", "limit", "2026-10-13 10:00"),      // a take-profit is not a stop
+		sell("CCC", "stop_limit", "2026-10-15 09:40"), // today
+		Fill{Symbol: "DDD", Side: "buy", Type: "stop", At: et(t, "2026-10-14 10:00"), Qty: 1},
+	)
+	if d, ok := s.SinceLastStop("AAA"); !ok || d != 4 {
+		t.Errorf("AAA = %d %v, want 4", d, ok)
+	}
+	if _, ok := s.SinceLastStop("BBB"); ok {
+		t.Error("a take-profit is not a stop-out")
+	}
+	if d, ok := s.SinceLastStop("CCC"); !ok || d != 0 {
+		t.Errorf("CCC = %d %v, want today", d, ok)
+	}
+	if _, ok := s.SinceLastStop("DDD"); ok {
+		t.Error("only sells count")
+	}
+	if _, ok := s.SinceLastStop("ZZZ"); ok {
+		t.Error("no fills, no stop-out")
+	}
+}

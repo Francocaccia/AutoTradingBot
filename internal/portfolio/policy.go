@@ -16,10 +16,14 @@ type Policy struct {
 	MaxStockPct    float64 // single stock or sector / thematic equity ETF
 	MaxBroadETFPct float64 // single diversified index ETF (SPY, QQQ...): it is not a single-name bet
 	MaxBondETFPct  float64 // single bond ETF (T-bill ETFs included)
-	SectorMaxPct   float64 // one sector of the equity sleeve
-	CreditMaxPct   float64 // all credit-risk bond ETFs combined
-	MaxDuration    float64 // portfolio weighted bond duration, years
-	MinRealCash    float64 // always keep this much actual cash, % of equity
+	// MaxSatellitePct caps all single stocks and sector / thematic equity ETFs
+	// together, % of equity: the model's stock picks are a satellite around the
+	// index-ETF core, never the portfolio. <= 0 means no cap.
+	MaxSatellitePct float64
+	SectorMaxPct    float64 // one sector of the equity sleeve
+	CreditMaxPct    float64 // all credit-risk bond ETFs combined
+	MaxDuration     float64 // portfolio weighted bond duration, years
+	MinRealCash     float64 // always keep this much actual cash, % of equity
 
 	// Target weights per sleeve, used to size bond purchases. The weekly
 	// review may move them inside the bands.
@@ -33,7 +37,7 @@ func DefaultPolicy() Policy {
 		EquityMin: 40, EquityMax: 75,
 		BondMin: 15, BondMax: 40,
 		CashMin: 5, CashMax: 30,
-		MaxStockPct: 10, MaxBroadETFPct: 20, MaxBondETFPct: 15, SectorMaxPct: 30, CreditMaxPct: 10, MaxDuration: 8, MinRealCash: 2,
+		MaxStockPct: 10, MaxBroadETFPct: 20, MaxSatellitePct: 15, MaxBondETFPct: 15, SectorMaxPct: 30, CreditMaxPct: 10, MaxDuration: 8, MinRealCash: 2,
 		TargetEquity: 60, TargetBond: 30, TargetCash: 10,
 	}
 }
@@ -163,6 +167,17 @@ func (b Book) BondDuration() (years, value float64) {
 	return years, value
 }
 
+// satelliteValue is the value held in equities that are not broad index ETFs.
+func (b Book) satelliteValue() float64 {
+	var v float64
+	for _, h := range b.Holdings {
+		if Sleeve(h.Symbol) == SleeveEquities && !IsBroadETF(h.Symbol) {
+			v += h.Value
+		}
+	}
+	return v
+}
+
 func (b Book) holdingValue(sym string) float64 {
 	var v float64
 	for _, h := range b.Holdings {
@@ -228,6 +243,11 @@ func (p Policy) Room(b Book, symbol, sector string) (room float64, binding strin
 		limit(pct(p.MaxBroadETFPct)-cur, fmt.Sprintf("single index ETF limit %.0f%%", p.MaxBroadETFPct))
 	} else {
 		limit(pct(p.MaxStockPct)-cur, fmt.Sprintf("single position limit %.0f%%", p.MaxStockPct))
+	}
+
+	// Satellite cap: every equity holding that is not a broad index ETF, together.
+	if sleeve == SleeveEquities && !IsBroadETF(symbol) && p.MaxSatellitePct > 0 {
+		limit(pct(p.MaxSatellitePct)-b.satelliteValue(), fmt.Sprintf("single stocks and sector ETFs combined limit %.0f%%", p.MaxSatellitePct))
 	}
 
 	// Sector cap for the equity sleeve (broad index ETFs exempt).

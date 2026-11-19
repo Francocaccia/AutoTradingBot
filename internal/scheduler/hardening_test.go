@@ -60,6 +60,7 @@ func TestPolicyStopIsNeverCloserThanTheMinimumDistance(t *testing.T) {
 func TestPolicyTradeWithoutAStopIsAPlainMarketOrder(t *testing.T) {
 	cfg := baseConfig()
 	cfg.MinPolicyStopPct = -1 // MIN_POLICY_STOP_PCT=0
+	cfg.RebalanceTranchePct = 5
 	s, o := reviewScheduler(cfg)
 	s.fetchBond = func(string) (*indicators.Result, error) { return calmETF(), nil }
 	cs := policyCycle(s, 72_000, map[string]float64{"AAPL": 28_000})

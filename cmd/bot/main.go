@@ -45,8 +45,9 @@ const (
 	defaultBlackoutMin      = 10
 	defaultMinPolicyStopPct = 3.0
 
-	defaultRebalanceTranchePct = 5.0
-	defaultRebalanceMaxWeek    = 2
+	defaultRebalanceTranchePct = 10.0
+	defaultRebalanceMaxWeek    = 5
+	defaultStopReentryDays     = 20
 
 	// defaultGuardsStartDate is the deploy date of the "atb-" order tagging:
 	// decisions before it do not count toward the daily/weekly caps.
@@ -151,6 +152,9 @@ func main() {
 		MinStopATRMult:     envFloat("MIN_STOP_ATR_MULT", risk.StopATRMultiple),
 		MinPolicyStopPct:   policyStopPct(envFloat("MIN_POLICY_STOP_PCT", defaultMinPolicyStopPct)),
 
+		PolicyFirst:             envBool("POLICY_FIRST", true),
+		StopReentryCooldownDays: envInt("STOP_REENTRY_COOLDOWN_DAYS", defaultStopReentryDays),
+
 		IPSBandsMode:              bandsMode,
 		RebalanceTranchePct:       rebalanceTranche,
 		RebalanceMaxTradesPerWeek: envPositive("REBALANCE_MAX_TRADES_PER_WEEK", defaultRebalanceMaxWeek),
@@ -227,6 +231,20 @@ func envList(name string) []string {
 		}
 	}
 	return out
+}
+
+// envBool reads a boolean (1/true/yes/on, 0/false/no/off), keeping def when unset or invalid.
+func envBool(name string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "":
+		return def
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	log.Printf("Invalid %s %q, using default %v", name, os.Getenv(name), def)
+	return def
 }
 
 func envString(name, def string) string {

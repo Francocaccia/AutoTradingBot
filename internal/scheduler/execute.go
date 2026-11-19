@@ -155,6 +155,13 @@ func (s *Scheduler) buyEligibility(p *pendingDecision, cs *cycleState) (why, key
 			return fmt.Sprintf("macro regime unavailable: only SGOV, BIL and SHY may be bought (not %s)", p.symbol), "macro-unavailable"
 		}
 	}
+	// The model's single-stock picks are a satellite: they wait until the
+	// index-ETF core and the bond sleeve have been built to the policy.
+	if !isBond && !portfolio.IsBroadETF(p.symbol) {
+		if reason := s.policyFirstReason(cs); reason != "" {
+			return reason, "policy-first"
+		}
+	}
 	// Catalyst. A bond ETF, or any review action, must quote ONE item of the
 	// PORTFOLIO block; a stock must quote a headline it was shown. (Band
 	// rebalancing needs neither: planRebalance chooses it, the model does not.)
@@ -173,6 +180,14 @@ func (s *Scheduler) buyEligibility(p *pendingDecision, cs *cycleState) (why, key
 	if s.cfg.ReentryCooldownDays > 0 {
 		if days, ok := cs.history.SinceLastSell(p.symbol); ok && days < s.cfg.ReentryCooldownDays {
 			return fmt.Sprintf("re-entry cooldown: sold %d trading day(s) ago, minimum %d", days, s.cfg.ReentryCooldownDays), "cooldown"
+		}
+	}
+
+	// A stop-out is not a reason to try again within days: the name gets a long
+	// cooldown (the ordinary one, after any sale, is shorter).
+	if s.cfg.StopReentryCooldownDays > 0 {
+		if days, ok := cs.history.SinceLastStop(p.symbol); ok && days < s.cfg.StopReentryCooldownDays {
+			return fmt.Sprintf("stop-out cooldown: stopped out %d trading day(s) ago, minimum %d", days, s.cfg.StopReentryCooldownDays), "stop-cooldown"
 		}
 	}
 

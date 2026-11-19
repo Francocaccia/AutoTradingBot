@@ -26,6 +26,7 @@ func TestBroadETFHasItsOwnSingleNameLimit(t *testing.T) {
 	if p.MaxBroadETFPct != 20 || p.MaxStockPct != 10 {
 		t.Fatalf("defaults: %+v", p)
 	}
+	p.MaxSatellitePct = 0 // the satellite cap has its own test
 	b := Book{Equity: 100_000, Cash: 60_000, Holdings: []Holding{{Symbol: "SPY", Value: 15_000}, {Symbol: "AAPL", Value: 9_000}, {Symbol: "XYZ", Value: 16_000, Sector: "Tech"}}}
 	// An index ETF may grow to 20%, a stock stops at 10%.
 	if room, bind := p.Room(b, "SPY", ""); room != 5_000 || !strings.Contains(bind, "index ETF") {
