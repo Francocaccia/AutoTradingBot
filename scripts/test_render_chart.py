@@ -156,7 +156,9 @@ class IllustrativeLabelTest(unittest.TestCase):
             with open(os.path.join(out, "performance.svg"), encoding="utf-8") as f:
                 self.assertNotIn("ILLUSTRATIVE", f.read())
 
-    def test_the_committed_charts_are_placeholders(self):
+    def test_the_committed_charts_are_never_sample_data(self):
+        # They are placeholders until real trading days exist and the real charts after that
+        # (the workflow redraws them); in no case may they carry the sample label.
         docs = os.path.join(HERE, "..", "docs")
         for name in ("performance.svg", "allocation.svg"):
             path = os.path.join(docs, name)
@@ -164,9 +166,9 @@ class IllustrativeLabelTest(unittest.TestCase):
                 continue
             with open(path, encoding="utf-8") as f:
                 svg = f.read()
-            self.assertIn("chart appears after", svg, name + " must stay a placeholder until real data exists")
-            self.assertNotIn("<polyline", svg)
-            self.assertNotIn("<rect x=\"", svg.replace('<rect width="760"', ""), name)
+            ET.fromstring(svg)
+            self.assertNotIn("ILLUSTRATIVE", svg, name)
+            self.assertTrue("chart appears after" in svg or "<polyline" in svg or "<rect" in svg, name)
 
 
 if __name__ == "__main__":

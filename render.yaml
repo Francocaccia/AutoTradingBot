@@ -19,7 +19,7 @@ services:
       # Optional: a custom domain allowed to read /stats/history from a browser.
       - key: CORS_EXTRA_ORIGIN
         sync: false
-      # advisory | gradual | off. Start with advisory (logs the rebalancing trade it
-      # would make, places nothing), then switch to gradual in the dashboard.
+      # gradual (default) | advisory | off. Advisory only LOGS the rebalancing it would
+      # do and enforces nothing: leave it on advisory and the policy bands are never met.
       - key: IPS_BANDS_MODE
-        sync: false
+        value: gradual
